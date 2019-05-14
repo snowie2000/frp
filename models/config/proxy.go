@@ -113,7 +113,7 @@ type BaseProxyConf struct {
 	HealthCheckConf
 }
 
-func (cfg *BaseProxyConf) GetBaseInfo() *BaseProxyConf {
+func (cfg *BaseProxyConf) GetBaseInfo() *BaseProxyConf { 
 	return cfg
 }
 

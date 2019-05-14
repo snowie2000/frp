@@ -357,8 +357,8 @@ type closeWriter interface {
 // down a dedicated channel
 func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 	_, err := io.Copy(dst, src)
-	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite()
+	if tcpConn, ok := dst.(io.Closer); ok {
+		tcpConn.Close()
 	}
 	errCh <- err
 }

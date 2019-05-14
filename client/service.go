@@ -17,7 +17,6 @@ package client
 import (
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -32,7 +31,7 @@ import (
 	"github.com/fatedier/frp/utils/util"
 	"github.com/fatedier/frp/utils/version"
 
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/xtaci/smux"
 )
 
 type Service struct {

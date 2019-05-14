@@ -22,7 +22,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"net/http"
@@ -44,7 +43,7 @@ import (
 	"github.com/fatedier/frp/utils/vhost"
 
 	"github.com/fatedier/golib/net/mux"
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/xtaci/smux"
 )
 
 const (
@@ -311,7 +310,7 @@ func (svr *Service) HandleListener(l frpNet.Listener) {
 			if g.GlbServerCfg.TcpMux {
 				fmuxCfg := fmux.DefaultConfig()
 				fmuxCfg.KeepAliveInterval = 20 * time.Second
-				fmuxCfg.LogOutput = ioutil.Discard
+				//fmuxCfg.LogOutput = ioutil.Discard
 				session, err := fmux.Server(frpConn, fmuxCfg)
 				if err != nil {
 					log.Warn("Failed to create mux connection: %v", err)

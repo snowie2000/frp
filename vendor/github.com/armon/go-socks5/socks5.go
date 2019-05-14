@@ -3,6 +3,7 @@ package socks5
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -48,6 +49,15 @@ type Config struct {
 
 	// Optional function for dialing out
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+type bufconn struct {
+	io.Reader
+	conn net.Conn
+}
+
+func (bufc *bufconn) Close() error {
+	return bufc.conn.Close()
 }
 
 // Server is reponsible for accepting connections and handling
@@ -120,7 +130,7 @@ func (s *Server) Serve(l net.Listener) error {
 // ServeConn is used to serve a single connection.
 func (s *Server) ServeConn(conn net.Conn) error {
 	defer conn.Close()
-	bufConn := bufio.NewReader(conn)
+	bufConn := &bufconn{bufio.NewReader(conn), conn}
 
 	// Read the version byte
 	version := []byte{0}
