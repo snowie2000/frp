@@ -49,6 +49,17 @@ Please try again later.</p>
 </body>
 </html>
 `
+	Waiting = `<!DOCTYPE html><html lang=en><meta charset=UTF-8><title>Loading</title><body><style>body,html{height:100%;padding:0;margin:0}
+	.wrapper{display:flex;justify-content:center;align-items:center;height:100px}.centerd{display:flex;justify-content:center;align-items:center;height:100%}
+	.ball{width:22px;height:22px;border-radius:11px;margin:0 10px;animation:2s bounce ease infinite}.blue{background-color:#4285f5}
+	.red{background-color:#ea4436;animation-delay:.25s}.yellow{background-color:#fbbd06;animation-delay:.5s}.green{background-color:#34a952;animation-delay:.75s}
+	@keyframes bounce{50%{transform:translateY(25px)}}</style><div class=centerd><div class=wrapper><div class="ball blue"></div><div class="ball red"></div>
+	<div class="ball yellow"></div><div class="ball green"></div></div></div><script>var xmlHttp,requestType="";function createXMLHttpRequest()
+	{window.ActiveXObject?xmlHttp=new ActiveXObject("Microsoft.XMLHTTP"):window.XMLHttpRequest&&(xmlHttp=new XMLHttpRequest)}
+	function doHeaderRequest(e,t){requestType=e,createXMLHttpRequest(),xmlHttp.onreadystatechange=handleStateChange,xmlHttp.open("Head",t,!0),xmlHttp.send(null)}
+	function handleStateChange(){4==xmlHttp.readyState&&"isResourceAvailable"==requestType&&getIsResourceAvailable()}function getIsResourceAvailable()
+	{521!=xmlHttp.status?window.location.reload(!0):checker=setTimeout(function(){doHeaderRequest("isResourceAvailable",window.location.href)},2e3)}
+	var checker=setTimeout(function(){doHeaderRequest("isResourceAvailable",window.location.href)},2e3)</script>`
 )
 
 func getNotFoundPageContent() []byte {
@@ -95,6 +106,27 @@ func noAuthResponse() *http.Response {
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     header,
+	}
+	return res
+}
+
+func getWaitingPageContent() []byte {
+	return []byte(Waiting)
+}
+
+func waitingResponse() *http.Response {
+	header := make(http.Header)
+	header.Set("server", "frp/"+version.Full())
+	header.Set("Content-Type", "text/html")
+
+	res := &http.Response{
+		Status:     "Redirecting",
+		StatusCode: 521, //Web Server Is Down from cloudflare
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Body:       ioutil.NopCloser(bytes.NewReader(getWaitingPageContent())),
 	}
 	return res
 }
