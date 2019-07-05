@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"strconv"
 	"strings"
@@ -36,8 +35,8 @@ import (
 	"github.com/fatedier/golib/errors"
 	frpIo "github.com/fatedier/golib/io"
 	"github.com/fatedier/golib/pool"
-	fmux "github.com/hashicorp/yamux"
 	pp "github.com/pires/go-proxyproto"
+	fmux "github.com/xtaci/smux"
 )
 
 // Proxy defines how to handle work connections for different proxy type.
@@ -340,14 +339,14 @@ func (pxy *XtcpProxy) InWorkConn(conn frpNet.Conn, m *msg.StartWorkConn) {
 
 	fmuxCfg := fmux.DefaultConfig()
 	fmuxCfg.KeepAliveInterval = 5 * time.Second
-	fmuxCfg.LogOutput = ioutil.Discard
+	//fmuxCfg.LogOutput = ioutil.Discard
 	sess, err := fmux.Server(kcpConn, fmuxCfg)
 	if err != nil {
 		pxy.Error("create yamux server from kcp connection error: %v", err)
 		return
 	}
 	defer sess.Close()
-	muxConn, err := sess.Accept()
+	muxConn, err := sess.AcceptStream()
 	if err != nil {
 		pxy.Error("accept for yamux connection error: %v", err)
 		return

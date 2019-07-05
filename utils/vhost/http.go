@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +68,7 @@ func NewHttpReverseProxy(option HttpReverseProxyOptions) *HttpReverseProxy {
 		responseHeaderTimeout: time.Duration(option.ResponseHeaderTimeoutS) * time.Second,
 		vhostRouter:           NewVhostRouters(),
 	}
-	proxy := &ReverseProxy{
+	proxy := NewReverseProxy(&httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"
 			url := req.Context().Value("url").(string)
@@ -93,14 +94,14 @@ func NewHttpReverseProxy(option HttpReverseProxyOptions) *HttpReverseProxy {
 				return rp.CreateConnection(host, url, remote)
 			},
 		},
-		WebSocketDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			url := ctx.Value("url").(string)
-			host := getHostFromAddr(ctx.Value("host").(string))
-			remote := ctx.Value("remote").(string)
-			return rp.CreateConnection(host, url, remote)
-		},
 		BufferPool: newWrapPool(),
 		ErrorLog:   log.New(newWrapLogger(), "", 0),
+	})
+	proxy.WebSocketDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		url := ctx.Value("url").(string)
+		host := getHostFromAddr(ctx.Value("host").(string))
+		remote := ctx.Value("remote").(string)
+		return rp.CreateConnection(host, url, remote)
 	}
 	rp.proxy = proxy
 	return rp
