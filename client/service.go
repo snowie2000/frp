@@ -31,7 +31,7 @@ import (
 	"github.com/fatedier/frp/utils/util"
 	"github.com/fatedier/frp/utils/version"
 
-	fmux "github.com/xtaci/smux"
+	fmux "github.com/hashicorp/yamux"
 )
 
 type Service struct {
