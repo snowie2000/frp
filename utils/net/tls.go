@@ -17,6 +17,7 @@ package net
 import (
 	"crypto/tls"
 	"net"
+	"time"
 
 	gnet "github.com/fatedier/golib/net"
 )
@@ -25,20 +26,27 @@ var (
 	FRP_TLS_HEAD_BYTE = 0x17
 )
 
-func WrapTLSClientConn(c net.Conn, tlsConfig *tls.Config) (out Conn) {
+func WrapTLSClientConn(c net.Conn, tlsConfig *tls.Config) (out net.Conn) {
 	c.Write([]byte{byte(FRP_TLS_HEAD_BYTE)})
-	out = WrapConn(tls.Client(c, tlsConfig))
+	out = tls.Client(c, tlsConfig)
 	return
 }
 
-func CheckAndEnableTLSServerConn(c net.Conn, tlsConfig *tls.Config) (out Conn) {
-	sc, r := gnet.NewSharedConnSize(c, 1)
+func CheckAndEnableTLSServerConnWithTimeout(c net.Conn, tlsConfig *tls.Config, timeout time.Duration) (out net.Conn, err error) {
+	sc, r := gnet.NewSharedConnSize(c, 2)
 	buf := make([]byte, 1)
-	n, _ := r.Read(buf)
+	var n int
+	c.SetReadDeadline(time.Now().Add(timeout))
+	n, err = r.Read(buf)
+	c.SetReadDeadline(time.Time{})
+	if err != nil {
+		return
+	}
+
 	if n == 1 && int(buf[0]) == FRP_TLS_HEAD_BYTE {
-		out = WrapConn(tls.Server(c, tlsConfig))
+		out = tls.Server(c, tlsConfig)
 	} else {
-		out = WrapConn(sc)
+		out = sc
 	}
 	return
 }

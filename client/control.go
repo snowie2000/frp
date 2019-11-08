@@ -15,19 +15,20 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/fatedier/frp/client/proxy"
-	"github.com/fatedier/frp/g"
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/msg"
-	"github.com/fatedier/frp/utils/log"
 	frpNet "github.com/fatedier/frp/utils/net"
+	"github.com/fatedier/frp/utils/xlog"
 
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
@@ -46,7 +47,7 @@ type Control struct {
 	vm *VisitorManager
 
 	// control connection
-	conn frpNet.Conn
+	conn net.Conn
 
 	// tcp stream multiplexing, if enabled
 	session *fmux.Session
@@ -65,16 +66,31 @@ type Control struct {
 	// last time got the Pong message
 	lastPong time.Time
 
+	// The client configuration
+	clientCfg config.ClientCommonConf
+
 	readerShutdown     *shutdown.Shutdown
 	writerShutdown     *shutdown.Shutdown
 	msgHandlerShutdown *shutdown.Shutdown
 
+	// The UDP port that the server is listening on
+	serverUDPPort int
+
 	mu sync.RWMutex
 
-	log.Logger
+	xl *xlog.Logger
+
+	// service context
+	ctx context.Context
 }
 
-func NewControl(runId string, conn frpNet.Conn, session *fmux.Session, pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) *Control {
+func NewControl(ctx context.Context, runId string, conn net.Conn, session *fmux.Session,
+	clientCfg config.ClientCommonConf,
+	pxyCfgs map[string]config.ProxyConf,
+	visitorCfgs map[string]config.VisitorConf,
+	serverUDPPort int) *Control {
+
+	// new xlog instance
 	ctl := &Control{
 		runId:              runId,
 		conn:               conn,
@@ -84,14 +100,17 @@ func NewControl(runId string, conn frpNet.Conn, session *fmux.Session, pxyCfgs m
 		readCh:             make(chan msg.Message, 100),
 		closedCh:           make(chan struct{}),
 		closedDoneCh:       make(chan struct{}),
+		clientCfg:          clientCfg,
 		readerShutdown:     shutdown.New(),
 		writerShutdown:     shutdown.New(),
 		msgHandlerShutdown: shutdown.New(),
-		Logger:             log.NewPrefixLogger(""),
+		serverUDPPort:      serverUDPPort,
+		xl:                 xlog.FromContextSafe(ctx),
+		ctx:                ctx,
 	}
-	ctl.pm = proxy.NewProxyManager(ctl.sendCh, runId)
+	ctl.pm = proxy.NewProxyManager(ctl.ctx, ctl.sendCh, clientCfg, serverUDPPort)
 
-	ctl.vm = NewVisitorManager(ctl)
+	ctl.vm = NewVisitorManager(ctl.ctx, ctl)
 	ctl.vm.Reload(visitorCfgs)
 	return ctl
 }
@@ -108,6 +127,7 @@ func (ctl *Control) Run() {
 }
 
 func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
+	xl := ctl.xl
 	workConn, err := ctl.connectServer()
 	if err != nil {
 		return
@@ -117,31 +137,31 @@ func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
 		RunId: ctl.runId,
 	}
 	if err = msg.WriteMsg(workConn, m); err != nil {
-		ctl.Warn("work connection write to server error: %v", err)
+		xl.Warn("work connection write to server error: %v", err)
 		workConn.Close()
 		return
 	}
 
 	var startMsg msg.StartWorkConn
 	if err = msg.ReadMsgInto(workConn, &startMsg); err != nil {
-		ctl.Error("work connection closed, %v", err)
+		xl.Error("work connection closed before response StartWorkConn message: %v", err)
 		workConn.Close()
 		return
 	}
-	workConn.AddLogPrefix(startMsg.ProxyName)
 
 	// dispatch this work connection to related proxy
 	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
 func (ctl *Control) HandleNewProxyResp(inMsg *msg.NewProxyResp) {
+	xl := ctl.xl
 	// Server will return NewProxyResp message to each NewProxy message.
 	// Start a new proxy handler if no error got
 	err := ctl.pm.StartProxy(inMsg.ProxyName, inMsg.RemoteAddr, inMsg.Error)
 	if err != nil {
-		ctl.Warn("[%s] start error: %v", inMsg.ProxyName, err)
+		xl.Warn("[%s] start error: %v", inMsg.ProxyName, err)
 	} else {
-		ctl.Info("[%s] start proxy success", inMsg.ProxyName)
+		xl.Info("[%s] start proxy success", inMsg.ProxyName)
 	}
 }
 
@@ -160,26 +180,27 @@ func (ctl *Control) ClosedDoneCh() <-chan struct{} {
 }
 
 // connectServer return a new connection to frps
-func (ctl *Control) connectServer() (conn frpNet.Conn, err error) {
-	if g.GlbClientCfg.TcpMux {
+func (ctl *Control) connectServer() (conn net.Conn, err error) {
+	xl := ctl.xl
+	if ctl.clientCfg.TcpMux {
 		stream, errRet := ctl.session.OpenStream()
 		if errRet != nil {
 			err = errRet
-			ctl.Warn("start new connection to server error: %v", err)
+			xl.Warn("start new connection to server error: %v", err)
 			return
 		}
-		conn = frpNet.WrapConn(stream)
+		conn = stream
 	} else {
 		var tlsConfig *tls.Config
-		if g.GlbClientCfg.TLSEnable {
+		if ctl.clientCfg.TLSEnable {
 			tlsConfig = &tls.Config{
 				InsecureSkipVerify: true,
 			}
 		}
-		conn, err = frpNet.ConnectServerByProxyWithTLS(g.GlbClientCfg.HttpProxy, g.GlbClientCfg.Protocol,
-			fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, g.GlbClientCfg.ServerPort), tlsConfig)
+		conn, err = frpNet.ConnectServerByProxyWithTLS(ctl.clientCfg.HttpProxy, ctl.clientCfg.Protocol,
+			fmt.Sprintf("%s:%d", ctl.clientCfg.ServerAddr, ctl.clientCfg.ServerPort), tlsConfig)
 		if err != nil {
-			ctl.Warn("start new connection to server error: %v", err)
+			xl.Warn("start new connection to server error: %v", err)
 			return
 		}
 	}
@@ -188,23 +209,24 @@ func (ctl *Control) connectServer() (conn frpNet.Conn, err error) {
 
 // reader read all messages from frps and send to readCh
 func (ctl *Control) reader() {
+	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
-			ctl.Error("panic error: %v", err)
-			ctl.Error(string(debug.Stack()))
+			xl.Error("panic error: %v", err)
+			xl.Error(string(debug.Stack()))
 		}
 	}()
 	defer ctl.readerShutdown.Done()
 	defer close(ctl.closedCh)
 
-	encReader := crypto.NewReader(ctl.conn, []byte(g.GlbClientCfg.Token))
+	encReader := crypto.NewReader(ctl.conn, []byte(ctl.clientCfg.Token))
 	for {
 		if m, err := msg.ReadMsg(encReader); err != nil {
 			if err == io.EOF {
-				ctl.Debug("read from control connection EOF")
+				xl.Debug("read from control connection EOF")
 				return
 			} else {
-				ctl.Warn("read error: %v", err)
+				xl.Warn("read error: %v", err)
 				ctl.conn.Close()
 				return
 			}
@@ -216,20 +238,21 @@ func (ctl *Control) reader() {
 
 // writer writes messages got from sendCh to frps
 func (ctl *Control) writer() {
+	xl := ctl.xl
 	defer ctl.writerShutdown.Done()
-	encWriter, err := crypto.NewWriter(ctl.conn, []byte(g.GlbClientCfg.Token))
+	encWriter, err := crypto.NewWriter(ctl.conn, []byte(ctl.clientCfg.Token))
 	if err != nil {
-		ctl.conn.Error("crypto new writer error: %v", err)
+		xl.Error("crypto new writer error: %v", err)
 		ctl.conn.Close()
 		return
 	}
 	for {
 		if m, ok := <-ctl.sendCh; !ok {
-			ctl.Info("control writer is closing")
+			xl.Info("control writer is closing")
 			return
 		} else {
 			if err := msg.WriteMsg(encWriter, m); err != nil {
-				ctl.Warn("write message to control connection error: %v", err)
+				xl.Warn("write message to control connection error: %v", err)
 				return
 			}
 		}
@@ -238,15 +261,16 @@ func (ctl *Control) writer() {
 
 // msgHandler handles all channel events and do corresponding operations.
 func (ctl *Control) msgHandler() {
+	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
-			ctl.Error("panic error: %v", err)
-			ctl.Error(string(debug.Stack()))
+			xl.Error("panic error: %v", err)
+			xl.Error(string(debug.Stack()))
 		}
 	}()
 	defer ctl.msgHandlerShutdown.Done()
 
-	hbSend := time.NewTicker(time.Duration(g.GlbClientCfg.HeartBeatInterval) * time.Second)
+	hbSend := time.NewTicker(time.Duration(ctl.clientCfg.HeartBeatInterval) * time.Second)
 	defer hbSend.Stop()
 	hbCheck := time.NewTicker(time.Second)
 	defer hbCheck.Stop()
@@ -257,11 +281,11 @@ func (ctl *Control) msgHandler() {
 		select {
 		case <-hbSend.C:
 			// send heartbeat to server
-			ctl.Debug("send heartbeat to server")
+			xl.Debug("send heartbeat to server")
 			ctl.sendCh <- &msg.Ping{}
 		case <-hbCheck.C:
-			if time.Since(ctl.lastPong) > time.Duration(g.GlbClientCfg.HeartBeatTimeout)*time.Second {
-				ctl.Warn("heartbeat timeout")
+			if time.Since(ctl.lastPong) > time.Duration(ctl.clientCfg.HeartBeatTimeout)*time.Second {
+				xl.Warn("heartbeat timeout")
 				// let reader() stop
 				ctl.conn.Close()
 				return
@@ -278,7 +302,7 @@ func (ctl *Control) msgHandler() {
 				ctl.HandleNewProxyResp(m)
 			case *msg.Pong:
 				ctl.lastPong = time.Now()
-				ctl.Debug("receive heartbeat from server")
+				xl.Debug("receive heartbeat from server")
 			}
 		}
 	}

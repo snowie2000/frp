@@ -24,7 +24,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/fatedier/frp/g"
 	"github.com/fatedier/frp/models/config"
 )
 
@@ -42,13 +41,13 @@ var reloadCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		err = parseClientCommonCfg(CfgFileTypeIni, iniContent)
+		clientCfg, err := parseClientCommonCfg(CfgFileTypeIni, iniContent)
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
-		err = reload()
+		err = reload(clientCfg)
 		if err != nil {
 			fmt.Printf("frpc reload error: %v\n", err)
 			os.Exit(1)
@@ -58,35 +57,34 @@ var reloadCmd = &cobra.Command{
 	},
 }
 
-func reload() error {
-	if g.GlbClientCfg.AdminPort == 0 {
+func reload(clientCfg config.ClientCommonConf) error {
+	if clientCfg.AdminPort == 0 {
 		return fmt.Errorf("admin_port shoud be set if you want to use reload feature")
 	}
 
 	req, err := http.NewRequest("GET", "http://"+
-		g.GlbClientCfg.AdminAddr+":"+fmt.Sprintf("%d", g.GlbClientCfg.AdminPort)+"/api/reload", nil)
+		clientCfg.AdminAddr+":"+fmt.Sprintf("%d", clientCfg.AdminPort)+"/api/reload", nil)
 	if err != nil {
 		return err
 	}
 
-	authStr := "Basic " + base64.StdEncoding.EncodeToString([]byte(g.GlbClientCfg.AdminUser+":"+
-		g.GlbClientCfg.AdminPwd))
+	authStr := "Basic " + base64.StdEncoding.EncodeToString([]byte(clientCfg.AdminUser+":"+
+		clientCfg.AdminPwd))
 
 	req.Header.Add("Authorization", authStr)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
-	} else {
-		if resp.StatusCode == 200 {
-			return nil
-		}
-
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("code [%d], %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return nil
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		return nil
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("code [%d], %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
