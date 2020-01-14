@@ -37,6 +37,8 @@ frp also has a P2P connect mode.
     * [Get proxy status from client](#get-proxy-status-from-client)
     * [Only allowing certain ports on the server](#only-allowing-certain-ports-on-the-server)
     * [Port Reuse](#port-reuse)
+    * [Bandwidth Limit](#bandwidth-limit)
+        * [For Each Proxy](#for-each-proxy)
     * [TCP Stream Multiplexing](#tcp-stream-multiplexing)
     * [Support KCP Protocol](#support-kcp-protocol)
     * [Connection Pooling](#connection-pooling)
@@ -52,7 +54,8 @@ frp also has a P2P connect mode.
     * [URL routing](#url-routing)
     * [Connecting to frps via HTTP PROXY](#connecting-to-frps-via-http-proxy)
     * [Range ports mapping](#range-ports-mapping)
-    * [Plugins](#plugins)
+    * [Client Plugins](#client-plugins)
+    * [Server Manage Plugins](#server-manage-plugins)
 * [Development Plan](#development-plan)
 * [Contributing](#contributing)
 * [Donation](#donation)
@@ -495,6 +498,21 @@ allow_ports = 2000-3000,3001,3003,4000-50000
 
 We would like to try to allow multiple proxies bind a same remote port with different protocols in the future.
 
+### Bandwidth Limit
+
+#### For Each Proxy
+
+```ini
+# frpc.ini
+[ssh]
+type = tcp
+local_port = 22
+remote_port = 6000
+bandwidth_limit = 1MB
+```
+
+Set `bandwidth_limit` in each proxy's configure to enable this feature. Supported units are `MB` and `KB`.
+
 ### TCP Stream Multiplexing
 
 frp supports tcp stream multiplexing since v0.10.0 like HTTP2 Multiplexing, in which case all logic connections to the same frpc are multiplexed into the same TCP connection.
@@ -789,7 +807,7 @@ remote_port = 6000-6006,6007
 
 frpc will generate 8 proxies like `test_tcp_0`, `test_tcp_1`, ..., `test_tcp_7`.
 
-### Plugins
+### Client Plugins
 
 frpc only forwards requests to local TCP or UDP ports by default.
 
@@ -810,6 +828,10 @@ plugin_http_passwd = abc
 ```
 
 `plugin_http_user` and `plugin_http_passwd` are configuration parameters used in `http_proxy` plugin.
+
+### Server Manage Plugins
+
+Read the [document](/doc/server_plugin.md).
 
 ## Development Plan
 

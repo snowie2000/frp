@@ -125,6 +125,14 @@ type BaseProxyConf struct {
 	// values include "v1", "v2", and "". If the value is "", a protocol
 	// version will be automatically selected. By default, this value is "".
 	ProxyProtocolVersion string `json:"proxy_protocol_version"`
+
+	// BandwidthLimit limit the proxy bandwidth
+	// 0 means no limit
+	BandwidthLimit BandwidthQuantity `json:"bandwidth_limit"`
+
+	// meta info for each proxy
+	Metas map[string]string `json:"metas"`
+
 	LocalSvrConf
 	HealthCheckConf
 }
@@ -140,7 +148,9 @@ func (cfg *BaseProxyConf) compare(cmp *BaseProxyConf) bool {
 		cfg.UseCompression != cmp.UseCompression ||
 		cfg.Group != cmp.Group ||
 		cfg.GroupKey != cmp.GroupKey ||
-		cfg.ProxyProtocolVersion != cmp.ProxyProtocolVersion {
+		cfg.ProxyProtocolVersion != cmp.ProxyProtocolVersion ||
+		cfg.BandwidthLimit.Equal(&cmp.BandwidthLimit) ||
+		!reflect.DeepEqual(cfg.Metas, cmp.Metas) {
 		return false
 	}
 	if !cfg.LocalSvrConf.compare(&cmp.LocalSvrConf) {
@@ -159,12 +169,14 @@ func (cfg *BaseProxyConf) UnmarshalFromMsg(pMsg *msg.NewProxy) {
 	cfg.UseCompression = pMsg.UseCompression
 	cfg.Group = pMsg.Group
 	cfg.GroupKey = pMsg.GroupKey
+	cfg.Metas = pMsg.Metas
 }
 
 func (cfg *BaseProxyConf) UnmarshalFromIni(prefix string, name string, section ini.Section) error {
 	var (
 		tmpStr string
 		ok     bool
+		err    error
 	)
 	cfg.ProxyName = prefix + name
 	cfg.ProxyType = section["type"]
@@ -183,11 +195,15 @@ func (cfg *BaseProxyConf) UnmarshalFromIni(prefix string, name string, section i
 	cfg.GroupKey = section["group_key"]
 	cfg.ProxyProtocolVersion = section["proxy_protocol_version"]
 
-	if err := cfg.LocalSvrConf.UnmarshalFromIni(prefix, name, section); err != nil {
+	if cfg.BandwidthLimit, err = NewBandwidthQuantity(section["bandwidth_limit"]); err != nil {
 		return err
 	}
 
-	if err := cfg.HealthCheckConf.UnmarshalFromIni(prefix, name, section); err != nil {
+	if err = cfg.LocalSvrConf.UnmarshalFromIni(prefix, name, section); err != nil {
+		return err
+	}
+
+	if err = cfg.HealthCheckConf.UnmarshalFromIni(prefix, name, section); err != nil {
 		return err
 	}
 
@@ -201,6 +217,13 @@ func (cfg *BaseProxyConf) UnmarshalFromIni(prefix string, name string, section i
 		}
 		cfg.HealthCheckUrl = s + cfg.HealthCheckUrl
 	}
+
+	cfg.Metas = make(map[string]string)
+	for k, v := range section {
+		if strings.HasPrefix(k, "meta_") {
+			cfg.Metas[strings.TrimPrefix(k, "meta_")] = v
+		}
+	}
 	return nil
 }
 
@@ -211,6 +234,7 @@ func (cfg *BaseProxyConf) MarshalToMsg(pMsg *msg.NewProxy) {
 	pMsg.UseCompression = cfg.UseCompression
 	pMsg.Group = cfg.Group
 	pMsg.GroupKey = cfg.GroupKey
+	pMsg.Metas = cfg.Metas
 }
 
 func (cfg *BaseProxyConf) checkForCli() (err error) {

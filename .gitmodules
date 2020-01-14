@@ -1,3 +1,0 @@
-[submodule "vendor/github.com/hashicorp/yamux"]
-	path = vendor/github.com/hashicorp/yamux
-	url = https://github.com/hashicorp/yamux.git
