@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"reflect"
 )
 
@@ -78,12 +79,16 @@ func (p *httpPlugin) do(ctx context.Context, r *Request, res *Response) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", p.url, bytes.NewReader(buf))
+	v := url.Values{}
+	v.Set("version", r.Version)
+	v.Set("op", r.Op)
+	req, err := http.NewRequest("POST", p.url+"?"+v.Encode(), bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}
 	req = req.WithContext(ctx)
 	req.Header.Set("X-Frp-Reqid", GetReqidFromContext(ctx))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return err

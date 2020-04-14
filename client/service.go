@@ -26,11 +26,11 @@ import (
 	"time"
 
 	"github.com/fatedier/frp/assets"
+	"github.com/fatedier/frp/models/auth"
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/msg"
 	"github.com/fatedier/frp/utils/log"
 	frpNet "github.com/fatedier/frp/utils/net"
-	"github.com/fatedier/frp/utils/util"
 	"github.com/fatedier/frp/utils/version"
 	"github.com/fatedier/frp/utils/xlog"
 
@@ -45,6 +45,9 @@ type Service struct {
 	// manager control connection with server
 	ctl   *Control
 	ctlMu sync.RWMutex
+
+	// Sets authentication based on selected method
+	authSetter auth.Setter
 
 	cfg         config.ClientCommonConf
 	pxyCfgs     map[string]config.ProxyConf
@@ -70,6 +73,7 @@ func NewService(cfg config.ClientCommonConf, pxyCfgs map[string]config.ProxyConf
 
 	ctx, cancel := context.WithCancel(context.Background())
 	svr = &Service{
+		authSetter:  auth.NewAuthSetter(cfg.AuthClientConfig),
 		cfg:         cfg,
 		cfgFile:     cfgFile,
 		pxyCfgs:     pxyCfgs,
@@ -105,7 +109,7 @@ func (svr *Service) Run() error {
 			}
 		} else {
 			// login success
-			ctl := NewControl(svr.ctx, svr.runId, conn, session, svr.cfg, svr.pxyCfgs, svr.visitorCfgs, svr.serverUDPPort)
+			ctl := NewControl(svr.ctx, svr.runId, conn, session, svr.cfg, svr.pxyCfgs, svr.visitorCfgs, svr.serverUDPPort, svr.authSetter)
 			ctl.Run()
 			svr.ctlMu.Lock()
 			svr.ctl = ctl
@@ -138,10 +142,32 @@ func (svr *Service) keepControllerWorking() {
 	maxDelayTime := 20 * time.Second
 	delayTime := time.Second
 
+	// if frpc reconnect frps, we need to limit retry times in 1min
+	// current retry logic is sleep 0s, 0s, 0s, 1s, 2s, 4s, 8s, ...
+	// when exceed 1min, we will reset delay and counts
+	cutoffTime := time.Now().Add(time.Minute)
+	reconnectDelay := time.Second
+	reconnectCounts := 1
+
 	for {
 		<-svr.ctl.ClosedDoneCh()
 		if atomic.LoadUint32(&svr.exit) != 0 {
 			return
+		}
+
+		// the first three retry with no delay
+		if reconnectCounts > 3 {
+			time.Sleep(reconnectDelay)
+			reconnectDelay *= 2
+		}
+		reconnectCounts++
+
+		now := time.Now()
+		if now.After(cutoffTime) {
+			// reset
+			cutoffTime = now.Add(time.Minute)
+			reconnectDelay = time.Second
+			reconnectCounts = 1
 		}
 
 		for {
@@ -159,9 +185,12 @@ func (svr *Service) keepControllerWorking() {
 			// reconnect success, init delayTime
 			delayTime = time.Second
 
-			ctl := NewControl(svr.ctx, svr.runId, conn, session, svr.cfg, svr.pxyCfgs, svr.visitorCfgs, svr.serverUDPPort)
+			ctl := NewControl(svr.ctx, svr.runId, conn, session, svr.cfg, svr.pxyCfgs, svr.visitorCfgs, svr.serverUDPPort, svr.authSetter)
 			ctl.Run()
 			svr.ctlMu.Lock()
+			if svr.ctl != nil {
+				svr.ctl.Close()
+			}
 			svr.ctl = ctl
 			svr.ctlMu.Unlock()
 			break
@@ -212,17 +241,20 @@ func (svr *Service) login() (conn net.Conn, session *fmux.Session, err error) {
 		conn = stream
 	}
 
-	now := time.Now().Unix()
 	loginMsg := &msg.Login{
-		Arch:         runtime.GOARCH,
-		Os:           runtime.GOOS,
-		PoolCount:    svr.cfg.PoolCount,
-		User:         svr.cfg.User,
-		Version:      version.Full(),
-		PrivilegeKey: util.GetAuthKey(svr.cfg.Token, now),
-		Timestamp:    now,
-		RunId:        svr.runId,
-		Metas:        svr.cfg.Metas,
+		Arch:      runtime.GOARCH,
+		Os:        runtime.GOOS,
+		PoolCount: svr.cfg.PoolCount,
+		User:      svr.cfg.User,
+		Version:   version.Full(),
+		Timestamp: time.Now().Unix(),
+		RunId:     svr.runId,
+		Metas:     svr.cfg.Metas,
+	}
+
+	// Add auth
+	if err = svr.authSetter.SetLogin(loginMsg); err != nil {
+		return
 	}
 
 	if err = msg.WriteMsg(conn, loginMsg); err != nil {
