@@ -3,7 +3,6 @@ module github.com/fatedier/frp
 go 1.12
 
 require (
-	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/coreos/go-oidc v2.2.1+incompatible
 	github.com/fatedier/beego v0.0.0-20171024143340-6c6a4f5bd5eb
 	github.com/fatedier/golib v0.0.0-20181107124048-ff8cd814b049

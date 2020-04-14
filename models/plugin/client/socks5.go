@@ -22,7 +22,7 @@ import (
 
 	frpNet "github.com/fatedier/frp/utils/net"
 
-	gosocks5 "github.com/armon/go-socks5"
+	gosocks5 "github.com/fatedier/frp/go-socks5"
 )
 
 const PluginSocks5 = "socks5"

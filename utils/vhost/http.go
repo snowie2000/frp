@@ -91,7 +91,7 @@ func NewHttpReverseProxy(option HttpReverseProxyOptions, vhostRouter *VhostRoute
 	})
 	proxy.WebSocketDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		url := ctx.Value("url").(string)
-		host := getHostFromAddr(ctx.Value("host").(string))
+		host := util.GetHostFromAddr(ctx.Value("host").(string))
 		remote := ctx.Value("remote").(string)
 		return rp.CreateConnection(host, url, remote)
 	}
