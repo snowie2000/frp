@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/big"
 	"net"
@@ -50,7 +51,7 @@ import (
 	"github.com/fatedier/frp/utils/xlog"
 
 	"github.com/fatedier/golib/net/mux"
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/whyrusleeping/yamux"
 )
 
 const (
@@ -376,7 +377,24 @@ func (svr *Service) HandleListener(l net.Listener) {
 				}
 			}
 
-			if svr.cfg.TcpMux {
+			isMuxReq := svr.cfg.TcpMux
+			if isMuxReq {
+				checkByte := make([]byte, 1)
+				if n, err := frpConn.Read(checkByte); n != 1 || err != nil { // first byte must be read
+					return
+				}
+				switch checkByte[0] { // check if it's actually a normal connection
+				case msg.TypeLogin:
+					fallthrough
+				case msg.TypeNewWorkConn:
+					fallthrough
+				case msg.TypeNewVisitorConn:
+					isMuxReq = false
+				}
+				frpConn = NewFushionConn(frpConn, checkByte) // feed checkbyte back to the frpConn
+			}
+
+			if isMuxReq {
 				fmuxCfg := fmux.DefaultConfig()
 				fmuxCfg.KeepAliveInterval = 20 * time.Second
 				fmuxCfg.LogOutput = ioutil.Discard
@@ -506,4 +524,20 @@ func generateTLSConfig() *tls.Config {
 		panic(err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+}
+
+type fushionConn struct {
+	net.Conn
+	buf io.Reader
+}
+
+func NewFushionConn(conn net.Conn, buf []byte) net.Conn {
+	return &fushionConn{
+		Conn: conn,
+		buf:  io.MultiReader(bytes.NewReader(buf), conn),
+	}
+}
+
+func (f *fushionConn) Read(p []byte) (int, error) {
+	return f.buf.Read(p)
 }

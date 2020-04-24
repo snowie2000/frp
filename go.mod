@@ -27,6 +27,7 @@ require (
 	github.com/templexxx/xor v0.0.0-20170926022130-0af8e873c554 // indirect
 	github.com/tjfoc/gmsm v0.0.0-20171124023159-98aa888b79d8 // indirect
 	github.com/vaughan0/go-ini v0.0.0-20130923145212-a98ad7ee00ec
+	github.com/whyrusleeping/yamux v1.2.0
 	github.com/xtaci/lossyconn v0.0.0-20190602105132-8df528c0c9ae // indirect
 	golang.org/x/net v0.0.0-20190724013045-ca1201d0de80
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d

@@ -33,7 +33,7 @@ import (
 
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/whyrusleeping/yamux"
 )
 
 type Control struct {

@@ -32,7 +32,7 @@ import (
 
 	frpIo "github.com/fatedier/golib/io"
 	"github.com/fatedier/golib/pool"
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/whyrusleeping/yamux"
 )
 
 // Visitor is used for forward traffics from local port tot remote service.
@@ -291,7 +291,7 @@ func (sv *XtcpVisitor) handleConn(userConn net.Conn) {
 	xl.Info("nat hole connection make success, sid [%s]", natHoleRespMsg.Sid)
 
 	// wrap kcp connection
-	var remote io.ReadWriteCloser
+	var remote net.Conn
 	remote, err = frpNet.NewKcpConnFromUdp(lConn, true, natHoleRespMsg.ClientAddr)
 	if err != nil {
 		xl.Error("create kcp connection from udp connection error: %v", err)
