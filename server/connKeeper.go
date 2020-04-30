@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fatedier/frp/models/msg"
+	errors2 "github.com/fatedier/golib/errors"
 	gnet "github.com/fatedier/golib/net"
 )
 
@@ -62,7 +63,9 @@ func (k *keeper) activeWait() {
 }
 
 func (k *keeper) requireWorkConn() {
-	k.controlChan <- &msg.ReqWorkConn{}
+	errors2.PanicToError(func() {
+		k.controlChan <- &msg.ReqWorkConn{}
+	})
 }
 
 func (k *keeper) AddConn(c net.Conn) error {
