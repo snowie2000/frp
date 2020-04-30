@@ -49,9 +49,10 @@ import (
 	"github.com/fatedier/frp/utils/version"
 	"github.com/fatedier/frp/utils/vhost"
 	"github.com/fatedier/frp/utils/xlog"
+	gnet "github.com/fatedier/golib/net"
 
 	"github.com/fatedier/golib/net/mux"
-	fmux "github.com/whyrusleeping/yamux"
+	fmux "github.com/hashicorp/yamux"
 )
 
 const (
@@ -304,6 +305,14 @@ func (svr *Service) HandleListener(l net.Listener) {
 		if err != nil {
 			log.Warn("Listener for incoming connections from client closed")
 			return
+		}
+
+		// enable tcp keepalive
+		if sc, ok := c.(*gnet.SharedConn); ok {
+			if tcpc, ok := sc.Conn.(*net.TCPConn); ok {
+				tcpc.SetKeepAlive(true)
+				tcpc.SetKeepAlivePeriod(time.Minute)
+			}
 		}
 		// inject xlog object into net.Conn context
 		xl := xlog.New()

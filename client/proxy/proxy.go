@@ -37,7 +37,7 @@ import (
 	"github.com/fatedier/golib/errors"
 	frpIo "github.com/fatedier/golib/io"
 	"github.com/fatedier/golib/pool"
-	fmux "github.com/whyrusleeping/yamux"
+	fmux "github.com/hashicorp/yamux"
 	pp "github.com/pires/go-proxyproto"
 	"golang.org/x/time/rate"
 )

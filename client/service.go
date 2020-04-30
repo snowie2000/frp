@@ -34,7 +34,7 @@ import (
 	"github.com/fatedier/frp/utils/version"
 	"github.com/fatedier/frp/utils/xlog"
 
-	fmux "github.com/whyrusleeping/yamux"
+	fmux "github.com/hashicorp/yamux"
 )
 
 // Service is a client service.

@@ -32,7 +32,7 @@ import (
 
 	frpIo "github.com/fatedier/golib/io"
 	"github.com/fatedier/golib/pool"
-	fmux "github.com/whyrusleeping/yamux"
+	fmux "github.com/hashicorp/yamux"
 )
 
 // Visitor is used for forward traffics from local port tot remote service.

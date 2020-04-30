@@ -38,7 +38,6 @@ import (
 
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
-	"github.com/fatedier/golib/errors"
 )
 
 type ControlManager struct {
@@ -108,7 +107,7 @@ type Control struct {
 	readCh chan (msg.Message)
 
 	// work connections
-	workConnCh chan net.Conn
+	workConnMgr *keeper
 
 	// proxies in one client
 	proxies map[string]proxy.Proxy
@@ -159,7 +158,7 @@ func NewControl(
 	if poolCount > int(serverCfg.MaxPoolCount) {
 		poolCount = int(serverCfg.MaxPoolCount)
 	}
-	return &Control{
+	ctl := &Control{
 		rc:              rc,
 		pxyManager:      pxyManager,
 		pluginManager:   pluginManager,
@@ -168,7 +167,6 @@ func NewControl(
 		loginMsg:        loginMsg,
 		sendCh:          make(chan msg.Message, 10),
 		readCh:          make(chan msg.Message, 10),
-		workConnCh:      make(chan net.Conn, poolCount+10),
 		proxies:         make(map[string]proxy.Proxy),
 		poolCount:       poolCount,
 		portsUsedNum:    0,
@@ -183,6 +181,8 @@ func NewControl(
 		xl:              xlog.FromContextSafe(ctx),
 		ctx:             ctx,
 	}
+	ctl.workConnMgr = NewKeeper(poolCount, ctl.sendCh, ctl.serverCfg.UserConnTimeout)
+	return ctl
 }
 
 // Start send a login success message to client and start working.
@@ -213,12 +213,10 @@ func (ctl *Control) RegisterWorkConn(conn net.Conn) error {
 			xl.Error(string(debug.Stack()))
 		}
 	}()
-
-	select {
-	case ctl.workConnCh <- conn:
+	if ctl.workConnMgr.AddConn(conn) == nil {
 		xl.Debug("new work connection registered")
 		return nil
-	default:
+	} else {
 		xl.Debug("work connection pool is full, discarding")
 		return fmt.Errorf("work connection pool is full, discarding")
 	}
@@ -239,42 +237,12 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 
 	var ok bool
 	// get a work connection from the pool
-	select {
-	case workConn, ok = <-ctl.workConnCh:
-		if !ok {
-			err = frpErr.ErrCtlClosed
-			return
-		}
-		xl.Debug("get work connection from pool")
-	default:
-		// no work connections available in the poll, send message to frpc to get more
-		err = errors.PanicToError(func() {
-			ctl.sendCh <- &msg.ReqWorkConn{}
-		})
-		if err != nil {
-			xl.Error("%v", err)
-			return
-		}
-
-		select {
-		case workConn, ok = <-ctl.workConnCh:
-			if !ok {
-				err = frpErr.ErrCtlClosed
-				xl.Warn("no work connections avaiable, %v", err)
-				return
-			}
-
-		case <-time.After(time.Duration(ctl.serverCfg.UserConnTimeout) * time.Second):
-			err = fmt.Errorf("timeout trying to get work connection")
-			xl.Warn("%v", err)
-			return
-		}
+	workConn, ok = ctl.workConnMgr.GetConn()
+	if !ok {
+		err = frpErr.ErrCtlClosed
+		return
 	}
-
-	// When we get a work connection from pool, replace it with a new one.
-	errors.PanicToError(func() {
-		ctl.sendCh <- &msg.ReqWorkConn{}
-	})
+	xl.Debug("get work connection from pool")
 	return
 }
 
@@ -368,10 +336,7 @@ func (ctl *Control) stoper() {
 	ctl.mu.Lock()
 	defer ctl.mu.Unlock()
 
-	close(ctl.workConnCh)
-	for workConn := range ctl.workConnCh {
-		workConn.Close()
-	}
+	ctl.workConnMgr.Stop()
 
 	for _, pxy := range ctl.proxies {
 		pxy.Close()
