@@ -113,10 +113,10 @@ func (k *keeper) keepalive(c *aliveConn) {
 		k.lock.Lock()
 		defer k.lock.Unlock()
 		log.Println("[keepalive] error", e)
+		c.Close()
 		for it := k.connList.Front(); it.Next() != nil; it = it.Next() {
 			if it.Value == c {
 				k.connList.Remove(it) // 不用去管connWait，下次尝试会自然失败
-				c.Close()
 				break
 			}
 		}
@@ -196,7 +196,7 @@ func (k *keeper) GetConn() (net.Conn, bool) {
 
 func (k *keeper) Stop() {
 	k.bClosed = true
-	k.connReq <- struct{}{}
+	k.connReq <- struct{}{}           // stop connFactory
 	for c := k.popConn(); c != nil; { // 关闭所有连接，同时会自动禁用所有keepalive
 		c.Close()
 	}
