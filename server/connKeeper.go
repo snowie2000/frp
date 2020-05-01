@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/fatedier/frp/models/msg"
-	errors2 "github.com/fatedier/golib/errors"
+	gerrors "github.com/fatedier/golib/errors"
 	gnet "github.com/fatedier/golib/net"
 )
 
@@ -63,12 +63,15 @@ func (k *keeper) activeWait() {
 }
 
 func (k *keeper) requireWorkConn() {
-	errors2.PanicToError(func() {
+	gerrors.PanicToError(func() {
 		k.controlChan <- &msg.ReqWorkConn{}
 	})
 }
 
 func (k *keeper) AddConn(c net.Conn) error {
+	if k.bClosed {
+		return errConnPoolFull
+	}
 	k.lock.Lock()
 	defer k.lock.Unlock()
 	if k.connList.Len() >= k.maxcount+10 { // 允许10个额外的连接
@@ -192,15 +195,23 @@ func (k *keeper) connFactory() {
 }
 
 func (k *keeper) GetConn() (net.Conn, bool) {
-	k.connReq <- struct{}{} // 请求获得一个连接
-	c := <-k.connResp       // 等待连接, 在超时前必定会获得一个结果，失败则是nil
-	return c, c != nil
+	if gerrors.PanicToError(func() { k.connReq <- struct{}{} }) == nil {
+		c := <-k.connResp // 等待连接, 在超时前必定会获得一个结果，失败则是nil
+		return c, c != nil
+	} else {
+		return nil, false
+	}
 }
 
 func (k *keeper) Stop() {
 	k.bClosed = true
-	k.connReq <- struct{}{}           // stop connFactory
-	for c := k.popConn(); c != nil; { // 关闭所有连接，同时会自动禁用所有keepalive
+	close(k.connReq) // stop connFactory
+	var c net.Conn
+	for { // 关闭所有连接，同时会自动禁用所有keepalive
+		c = k.popConn()
+		if c == nil {
+			return
+		}
 		c.Close()
 	}
 }
