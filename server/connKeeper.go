@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/fatedier/frp/utils/xlog"
 
 	"github.com/fatedier/frp/models/msg"
+	gerrors "github.com/fatedier/golib/errors"
 	gnet "github.com/fatedier/golib/net"
 )
 
@@ -67,22 +67,17 @@ func (k *keeper) activeWait() {
 }
 
 func (k *keeper) requireWorkConn() {
-	defer func() {
-		if e := recover(); e != nil {
-			k.logger.Info("%v", e)
-		}
-	}()
-	if !k.bClosed {
+	gerrors.PanicToError(func() {
 		k.controlChan <- &msg.ReqWorkConn{}
-	}
+	})
 }
 
 func (k *keeper) AddConn(c net.Conn) error {
-	k.lock.Lock()
-	defer k.lock.Unlock()
 	if k.bClosed {
 		return errConnKeeperClosed
 	}
+	k.lock.Lock()
+	defer k.lock.Unlock()
 	if k.connList.Len() >= k.maxcount+10 { // 允许10个额外的连接
 		return errConnPoolFull
 	}
@@ -109,8 +104,7 @@ func (k *keeper) AddConn(c net.Conn) error {
 	k.connList.PushBack(c)
 	k.activeWait() // 唤醒等待新连接的factory routine
 	if k.maxcount > 0 {
-		log.Println(k.connList.Len(), "in pool, max", k.maxcount)
-		log.Println(k.connList.Len(), "in pool, max", k.maxcount)
+		//log.Println(k.connList.Len(), "in pool, max", k.maxcount)
 	}
 	return nil
 }
@@ -128,7 +122,7 @@ func (k *keeper) keepalive(c *aliveConn) {
 		// 该连接异常断开，从pool中删除连接并申请一个新连接
 		k.lock.Lock()
 		defer k.lock.Unlock()
-		log.Println("[keepalive] error", e)
+		k.logger.Info("[keepalive] error: %v", e)
 		c.Close()
 		for it := k.connList.Front(); it.Next() != nil; it = it.Next() {
 			if it.Value == c {
@@ -147,7 +141,6 @@ func (k *keeper) keepalive(c *aliveConn) {
 func (k *keeper) popConn() net.Conn {
 	k.lock.Lock()
 	defer k.lock.Unlock()
-	k.logger.Info("popping net.Conn")
 	if k.connList.Len() > 0 { // pool 中还在连接
 		c := k.connList.Remove(k.connList.Front()).(net.Conn)
 		if conn, ok := c.(*aliveConn); ok { // 是正在keepalive的conn，取消keepalive，并等在取消完成
@@ -161,10 +154,8 @@ func (k *keeper) popConn() net.Conn {
 		if k.connList.Len() < k.maxcount && !k.bClosed {
 			k.requireWorkConn()
 		}
-		k.logger.Info("here you go, %d in stock", k.connCount)
 		return c
 	} else {
-		k.logger.Info("we're exhausted")
 		return nil
 	}
 }
@@ -207,15 +198,12 @@ func (k *keeper) connFactory() {
 }
 
 func (k *keeper) GetConn() (c net.Conn, success bool) {
-	defer func() {
-		if err := recover(); err != nil {
-			c = nil
-			success = false
-		}
-	}()
-	k.connReq <- struct{}{} // 请求获得一个连接
-	c = <-k.connResp        // 等待连接, 在超时前必定会获得一个结果，失败则是nil
-	return c, c != nil
+	if gerrors.PanicToError(func() { k.connReq <- struct{}{} }) == nil {
+		c := <-k.connResp // 等待连接, 在超时前必定会获得一个结果，失败则是nil
+		return c, c != nil
+	} else {
+		return nil, false
+	}
 }
 
 func (k *keeper) Stop() {
@@ -225,8 +213,12 @@ func (k *keeper) Stop() {
 	k.bClosed = true
 	close(k.connReq) // stop connFactory
 	k.lock.Unlock()
-	for c := k.popConn(); c != nil; c = k.popConn() { // 关闭所有连接，同时会自动禁用所有keepalive
-		k.logger.Info("closing")
+	var c net.Conn
+	for { // 关闭所有连接，同时会自动禁用所有keepalive
+		c = k.popConn()
+		if c == nil {
+			return
+		}
 		c.Close()
 	}
 	k.logger.Info("ok")
