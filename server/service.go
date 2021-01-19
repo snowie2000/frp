@@ -389,9 +389,11 @@ func (svr *Service) HandleListener(l net.Listener) {
 			isMuxReq := svr.cfg.TcpMux
 			if isMuxReq {
 				checkByte := make([]byte, 1)
+				frpConn.SetReadDeadline(time.Now().Add(connReadTimeout))
 				if n, err := frpConn.Read(checkByte); n != 1 || err != nil { // first byte must be read
 					return
 				}
+				frpConn.SetReadDeadline(time.Time{})
 				switch checkByte[0] { // check if it's actually a normal connection
 				case msg.TypeLogin:
 					fallthrough

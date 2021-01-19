@@ -181,7 +181,7 @@ func NewControl(
 		xl:              xlog.FromContextSafe(ctx),
 		ctx:             ctx,
 	}
-	ctl.workConnMgr = NewKeeper(poolCount, ctl.sendCh, ctl.serverCfg.UserConnTimeout)
+	ctl.workConnMgr = NewKeeper(poolCount, ctl.sendCh, ctl.serverCfg.UserConnTimeout, ctl.xl)
 	return ctl
 }
 
@@ -436,7 +436,6 @@ func (ctl *Control) manager() {
 					return
 				}
 				ctl.lastPing = time.Now()
-				xl.Debug("receive heartbeat")
 				ctl.sendCh <- &msg.Pong{}
 			}
 		}
