@@ -52,7 +52,7 @@ import (
 	gnet "github.com/fatedier/golib/net"
 
 	"github.com/fatedier/golib/net/mux"
-	fmux "github.com/hashicorp/yamux"
+	fmux "github.com/libp2p/go-yamux"
 )
 
 const (
