@@ -9,37 +9,18 @@ package vhost
 import (
 	"context"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
-
-	frpIo "github.com/fatedier/golib/io"
 )
 
 type ReverseProxy struct {
 	*httputil.ReverseProxy
-	WebSocketDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-}
-
-func IsWebsocketRequest(req *http.Request) bool {
-	containsHeader := func(name, value string) bool {
-		items := strings.Split(req.Header.Get(name), ",")
-		for _, item := range items {
-			if value == strings.ToLower(strings.TrimSpace(item)) {
-				return true
-			}
-		}
-		return false
-	}
-	return containsHeader("Connection", "upgrade") && containsHeader("Upgrade", "websocket")
 }
 
 func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
 	rp := &ReverseProxy{
-		ReverseProxy:         httputil.NewSingleHostReverseProxy(target),
-		WebSocketDialContext: nil,
+		ReverseProxy: httputil.NewSingleHostReverseProxy(target),
 	}
 	rp.ErrorHandler = rp.errHandler
 	return rp
@@ -47,8 +28,7 @@ func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
 
 func NewReverseProxy(orp *httputil.ReverseProxy) *ReverseProxy {
 	rp := &ReverseProxy{
-		ReverseProxy:         orp,
-		WebSocketDialContext: nil,
+		ReverseProxy: orp,
 	}
 	rp.ErrorHandler = rp.errHandler
 	return rp
@@ -66,43 +46,9 @@ func (p *ReverseProxy) errHandler(rw http.ResponseWriter, r *http.Request, e err
 
 func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Modify for frp
-	req = req.WithContext(context.WithValue(req.Context(), "url", req.URL.Path))
-	req = req.WithContext(context.WithValue(req.Context(), "host", req.Host))
-	req = req.WithContext(context.WithValue(req.Context(), "remote", req.RemoteAddr))
+	req = req.WithContext(context.WithValue(req.Context(), RouteInfoURL, req.URL.Path))
+	req = req.WithContext(context.WithValue(req.Context(), RouteInfoHost, req.Host))
+	req = req.WithContext(context.WithValue(req.Context(), RouteInfoRemote, req.RemoteAddr))
 
-	if IsWebsocketRequest(req) {
-		p.serveWebSocket(rw, req)
-	} else {
-		p.ReverseProxy.ServeHTTP(rw, req)
-	}
-}
-
-func (p *ReverseProxy) serveWebSocket(rw http.ResponseWriter, req *http.Request) {
-	if p.WebSocketDialContext == nil {
-		rw.WriteHeader(500)
-		return
-	}
-	targetConn, err := p.WebSocketDialContext(req.Context(), "tcp", "")
-	if err != nil {
-		rw.WriteHeader(501)
-		return
-	}
-	defer targetConn.Close()
-
-	p.Director(req)
-
-	hijacker, ok := rw.(http.Hijacker)
-	if !ok {
-		rw.WriteHeader(500)
-		return
-	}
-	conn, _, errHijack := hijacker.Hijack()
-	if errHijack != nil {
-		rw.WriteHeader(500)
-		return
-	}
-	defer conn.Close()
-
-	req.Write(targetConn)
-	frpIo.Join(conn, targetConn)
+	p.ReverseProxy.ServeHTTP(rw, req)
 }
