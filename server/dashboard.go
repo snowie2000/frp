@@ -15,13 +15,12 @@
 package server
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/fatedier/frp/assets"
-	frpNet "github.com/fatedier/frp/utils/net"
+	frpNet "github.com/fatedier/frp/pkg/util/net"
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,12 +31,12 @@ var (
 	httpServerWriteTimeout = 10 * time.Second
 )
 
-func (svr *Service) RunDashboardServer(addr string, port int) (err error) {
+func (svr *Service) RunDashboardServer(address string) (err error) {
 	// url router
 	router := mux.NewRouter()
 
 	user, passwd := svr.cfg.DashboardUser, svr.cfg.DashboardPwd
-	router.Use(frpNet.NewHttpAuthMiddleware(user, passwd).Middleware)
+	router.Use(frpNet.NewHTTPAuthMiddleware(user, passwd).Middleware)
 
 	// metrics
 	if svr.cfg.EnablePrometheus {
@@ -45,27 +44,26 @@ func (svr *Service) RunDashboardServer(addr string, port int) (err error) {
 	}
 
 	// api, see dashboard_api.go
-	router.HandleFunc("/api/serverinfo", svr.ApiServerInfo).Methods("GET")
-	router.HandleFunc("/api/proxy/{type}", svr.ApiProxyByType).Methods("GET")
-	router.HandleFunc("/api/proxy/{type}/{name}", svr.ApiProxyByTypeAndName).Methods("GET")
-	router.HandleFunc("/api/traffic/{name}", svr.ApiProxyTraffic).Methods("GET")
+	router.HandleFunc("/api/serverinfo", svr.APIServerInfo).Methods("GET")
+	router.HandleFunc("/api/proxy/{type}", svr.APIProxyByType).Methods("GET")
+	router.HandleFunc("/api/proxy/{type}/{name}", svr.APIProxyByTypeAndName).Methods("GET")
+	router.HandleFunc("/api/traffic/{name}", svr.APIProxyTraffic).Methods("GET")
 
 	// view
 	router.Handle("/favicon.ico", http.FileServer(assets.FileSystem)).Methods("GET")
-	router.PathPrefix("/static/").Handler(frpNet.MakeHttpGzipHandler(http.StripPrefix("/static/", http.FileServer(assets.FileSystem)))).Methods("GET")
+	router.PathPrefix("/static/").Handler(frpNet.MakeHTTPGzipHandler(http.StripPrefix("/static/", http.FileServer(assets.FileSystem)))).Methods("GET")
 
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/static/", http.StatusMovedPermanently)
 	})
 
-	address := fmt.Sprintf("%s:%d", addr, port)
 	server := &http.Server{
 		Addr:         address,
 		Handler:      router,
 		ReadTimeout:  httpServerReadTimeout,
 		WriteTimeout: httpServerWriteTimeout,
 	}
-	if address == "" {
+	if address == "" || address == ":" {
 		address = ":http"
 	}
 	ln, err := net.Listen("tcp", address)

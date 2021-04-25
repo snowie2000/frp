@@ -55,7 +55,7 @@ func TestConfTemplate(t *testing.T) {
 		defer frpsProcess.Stop()
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	frpcProcess := util.NewProcess("env", []string{"FRP_TOKEN=123456", "TCP_REMOTE_PORT=20801", consts.FRPC_BIN_PATH, "-c", frpcCfgPath})
 	err = frpcProcess.Start()
@@ -66,7 +66,7 @@ func TestConfTemplate(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// test tcp1
-	res, err := util.SendTcpMsg("127.0.0.1:20801", consts.TEST_TCP_ECHO_STR)
+	res, err := util.SendTCPMsg("127.0.0.1:20801", consts.TEST_TCP_ECHO_STR)
 	assert.NoError(err)
 	assert.Equal(consts.TEST_TCP_ECHO_STR, res)
 }

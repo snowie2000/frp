@@ -29,6 +29,8 @@ packages/
 release/
 test/bin/
 vendor/
+dist/
+.idea/
 
 # Cache
 *.swp
