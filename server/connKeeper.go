@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fatedier/frp/utils/xlog"
+	"github.com/fatedier/frp/pkg/util/xlog"
 
-	"github.com/fatedier/frp/models/msg"
+	"github.com/fatedier/frp/pkg/msg"
 	gerrors "github.com/fatedier/golib/errors"
 	gnet "github.com/fatedier/golib/net"
 )
