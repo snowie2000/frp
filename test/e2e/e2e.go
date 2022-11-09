@@ -3,12 +3,12 @@ package e2e
 import (
 	"testing"
 
-	"github.com/fatedier/frp/pkg/util/log"
-	"github.com/fatedier/frp/test/e2e/framework"
-
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	"github.com/onsi/gomega"
+
+	"github.com/fatedier/frp/pkg/util/log"
+	"github.com/fatedier/frp/test/e2e/framework"
 )
 
 var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
@@ -49,7 +49,6 @@ func RunE2ETests(t *testing.T) {
 // accepting the byte array.
 func setupSuite() {
 	// Run only on Ginkgo node 1
-	// TODO
 }
 
 // setupSuitePerGinkgoNode is the boilerplate that can be used to setup ginkgo test suites, on the SynchronizedBeforeSuite step.

@@ -18,10 +18,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/consts"
-
-	"github.com/spf13/cobra"
 )
 
 func init() {
@@ -45,7 +45,7 @@ var stcpCmd = &cobra.Command{
 	Use:   "stcp",
 	Short: "Run frpc with a single stcp proxy",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		clientCfg, err := parseClientCommonCfg(CfgFileTypeCmd, nil)
+		clientCfg, err := parseClientCommonCfgFromCmd()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)

@@ -16,13 +16,15 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"reflect"
+	"strconv"
 	"strings"
+
+	"gopkg.in/ini.v1"
 
 	"github.com/fatedier/frp/pkg/consts"
 	"github.com/fatedier/frp/pkg/msg"
-
-	"gopkg.in/ini.v1"
 )
 
 // Proxy
@@ -143,7 +145,6 @@ type BaseProxyConf struct {
 	// meta info for each proxy
 	Metas map[string]string `ini:"-" json:"metas"`
 
-	// TODO: LocalSvrConf => LocalAppConf
 	LocalSvrConf    `ini:",extends"`
 	HealthCheckConf `ini:",extends"`
 }
@@ -163,6 +164,7 @@ type HTTPProxyConf struct {
 	HTTPPwd           string            `ini:"http_pwd" json:"http_pwd"`
 	HostHeaderRewrite string            `ini:"host_header_rewrite" json:"host_header_rewrite"`
 	Headers           map[string]string `ini:"-" json:"headers"`
+	RouteByHTTPUser   string            `ini:"route_by_http_user" json:"route_by_http_user"`
 }
 
 // HTTPS
@@ -179,8 +181,9 @@ type TCPProxyConf struct {
 
 // TCPMux
 type TCPMuxProxyConf struct {
-	BaseProxyConf `ini:",extends"`
-	DomainConf    `ini:",extends"`
+	BaseProxyConf   `ini:",extends"`
+	DomainConf      `ini:",extends"`
+	RouteByHTTPUser string `ini:"route_by_http_user" json:"route_by_http_user"`
 
 	Multiplexer string `ini:"multiplexer"`
 }
@@ -274,7 +277,7 @@ func NewProxyConfFromIni(prefix, name string, section *ini.Section) (ProxyConf, 
 
 	conf := DefaultProxyConf(proxyType)
 	if conf == nil {
-		return nil, fmt.Errorf("proxy [%s] type [%s] error", name, proxyType)
+		return nil, fmt.Errorf("proxy %s has invalid type [%s]", name, proxyType)
 	}
 
 	if err := conf.UnmarshalFromIni(prefix, name, section); err != nil {
@@ -371,7 +374,7 @@ func (cfg *BaseProxyConf) decorate(prefix string, name string, section *ini.Sect
 	}
 
 	if cfg.HealthCheckType == "http" && cfg.Plugin == "" && cfg.HealthCheckURL != "" {
-		s := fmt.Sprintf("http://%s:%d", cfg.LocalIP, cfg.LocalPort)
+		s := "http://" + net.JoinHostPort(cfg.LocalIP, strconv.Itoa(cfg.LocalPort))
 		if !strings.HasPrefix(cfg.HealthCheckURL, "/") {
 			s += "/"
 		}
@@ -414,10 +417,6 @@ func (cfg *BaseProxyConf) checkForCli() (err error) {
 	if err = cfg.HealthCheckConf.checkForCli(); err != nil {
 		return
 	}
-	return nil
-}
-
-func (cfg *BaseProxyConf) checkForSvr(conf ServerCommonConf) error {
 	return nil
 }
 
@@ -577,7 +576,7 @@ func (cfg *TCPMuxProxyConf) Compare(cmp ProxyConf) bool {
 		return false
 	}
 
-	if cfg.Multiplexer != cmpConf.Multiplexer {
+	if cfg.Multiplexer != cmpConf.Multiplexer || cfg.RouteByHTTPUser != cmpConf.RouteByHTTPUser {
 		return false
 	}
 
@@ -602,6 +601,7 @@ func (cfg *TCPMuxProxyConf) UnmarshalFromMsg(pMsg *msg.NewProxy) {
 	cfg.CustomDomains = pMsg.CustomDomains
 	cfg.SubDomain = pMsg.SubDomain
 	cfg.Multiplexer = pMsg.Multiplexer
+	cfg.RouteByHTTPUser = pMsg.RouteByHTTPUser
 }
 
 func (cfg *TCPMuxProxyConf) MarshalToMsg(pMsg *msg.NewProxy) {
@@ -611,6 +611,7 @@ func (cfg *TCPMuxProxyConf) MarshalToMsg(pMsg *msg.NewProxy) {
 	pMsg.CustomDomains = cfg.CustomDomains
 	pMsg.SubDomain = cfg.SubDomain
 	pMsg.Multiplexer = cfg.Multiplexer
+	pMsg.RouteByHTTPUser = cfg.RouteByHTTPUser
 }
 
 func (cfg *TCPMuxProxyConf) CheckForCli() (err error) {
@@ -725,6 +726,7 @@ func (cfg *HTTPProxyConf) Compare(cmp ProxyConf) bool {
 		cfg.HTTPUser != cmpConf.HTTPUser ||
 		cfg.HTTPPwd != cmpConf.HTTPPwd ||
 		cfg.HostHeaderRewrite != cmpConf.HostHeaderRewrite ||
+		cfg.RouteByHTTPUser != cmpConf.RouteByHTTPUser ||
 		!reflect.DeepEqual(cfg.Headers, cmpConf.Headers) {
 		return false
 	}
@@ -755,6 +757,7 @@ func (cfg *HTTPProxyConf) UnmarshalFromMsg(pMsg *msg.NewProxy) {
 	cfg.HTTPUser = pMsg.HTTPUser
 	cfg.HTTPPwd = pMsg.HTTPPwd
 	cfg.Headers = pMsg.Headers
+	cfg.RouteByHTTPUser = pMsg.RouteByHTTPUser
 }
 
 func (cfg *HTTPProxyConf) MarshalToMsg(pMsg *msg.NewProxy) {
@@ -768,6 +771,7 @@ func (cfg *HTTPProxyConf) MarshalToMsg(pMsg *msg.NewProxy) {
 	pMsg.HTTPUser = cfg.HTTPUser
 	pMsg.HTTPPwd = cfg.HTTPPwd
 	pMsg.Headers = cfg.Headers
+	pMsg.RouteByHTTPUser = cfg.RouteByHTTPUser
 }
 
 func (cfg *HTTPProxyConf) CheckForCli() (err error) {

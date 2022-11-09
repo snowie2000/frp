@@ -16,16 +16,16 @@ package vhost
 
 import (
 	"bytes"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 
 	frpLog "github.com/fatedier/frp/pkg/util/log"
 	"github.com/fatedier/frp/pkg/util/version"
 )
 
-var (
-	NotFoundPagePath = ""
-)
+var NotFoundPagePath = ""
 
 const (
 	NotFound = `<!DOCTYPE html>
@@ -68,7 +68,7 @@ func getNotFoundPageContent() []byte {
 		err error
 	)
 	if NotFoundPagePath != "" {
-		buf, err = ioutil.ReadFile(NotFoundPagePath)
+		buf, err = os.ReadFile(NotFoundPagePath)
 		if err != nil {
 			frpLog.Warn("read custom 404 page error: %v", err)
 			buf = []byte(NotFound)
@@ -84,14 +84,16 @@ func notFoundResponse() *http.Response {
 	header.Set("server", "frp/"+version.Full())
 	header.Set("Content-Type", "text/html")
 
+	content := getNotFoundPageContent()
 	res := &http.Response{
-		Status:     "Not Found",
-		StatusCode: 404,
-		Proto:      "HTTP/1.0",
-		ProtoMajor: 1,
-		ProtoMinor: 0,
-		Header:     header,
-		Body:       ioutil.NopCloser(bytes.NewReader(getNotFoundPageContent())),
+		Status:        "Not Found",
+		StatusCode:    404,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(content)),
+		ContentLength: int64(len(content)),
 	}
 	return res
 }

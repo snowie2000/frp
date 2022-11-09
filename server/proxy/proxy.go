@@ -21,6 +21,9 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
+
+	frpIo "github.com/fatedier/golib/io"
 
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/msg"
@@ -29,8 +32,6 @@ import (
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
 	"github.com/fatedier/frp/server/metrics"
-
-	frpIo "github.com/fatedier/golib/io"
 )
 
 type GetWorkConnFn func() (net.Conn, error)
@@ -151,12 +152,28 @@ func (pxy *BaseProxy) startListenHandler(p Proxy, handler func(Proxy, net.Conn, 
 	xl := xlog.FromContextSafe(pxy.ctx)
 	for _, listener := range pxy.listeners {
 		go func(l net.Listener) {
+			var tempDelay time.Duration // how long to sleep on accept failure
+
 			for {
 				// block
 				// if listener is closed, err returned
 				c, err := l.Accept()
 				if err != nil {
-					xl.Info("listener is closed")
+					if err, ok := err.(interface{ Temporary() bool }); ok && err.Temporary() {
+						if tempDelay == 0 {
+							tempDelay = 5 * time.Millisecond
+						} else {
+							tempDelay *= 2
+						}
+						if max := 1 * time.Second; tempDelay > max {
+							tempDelay = max
+						}
+						xl.Info("met temporary error: %s, sleep for %s ...", err, tempDelay)
+						time.Sleep(tempDelay)
+						continue
+					}
+
+					xl.Warn("listener is closed: %s", err)
 					return
 				}
 				xl.Info("get a user connection [%s]", c.RemoteAddr().String())
@@ -167,8 +184,8 @@ func (pxy *BaseProxy) startListenHandler(p Proxy, handler func(Proxy, net.Conn, 
 }
 
 func NewProxy(ctx context.Context, userInfo plugin.UserInfo, rc *controller.ResourceController, poolCount int,
-	getWorkConnFn GetWorkConnFn, pxyConf config.ProxyConf, serverCfg config.ServerCommonConf) (pxy Proxy, err error) {
-
+	getWorkConnFn GetWorkConnFn, pxyConf config.ProxyConf, serverCfg config.ServerCommonConf,
+) (pxy Proxy, err error) {
 	xl := xlog.FromContextSafe(ctx).Spawn().AppendPrefix(pxyConf.GetBaseInfo().ProxyName)
 	basePxy := BaseProxy{
 		name:          pxyConf.GetBaseInfo().ProxyName,
