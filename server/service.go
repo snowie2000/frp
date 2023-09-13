@@ -297,11 +297,11 @@ func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 
 	// Create nat hole controller.
 	nc, err := nathole.NewController(time.Duration(cfg.NatHoleAnalysisDataReserveHours) * time.Hour)
-		if err != nil {
-			err = fmt.Errorf("create nat hole controller error, %v", err)
-			return
-		}
-		svr.rc.NatHoleController = nc
+	if err != nil {
+		err = fmt.Errorf("create nat hole controller error, %v", err)
+		return
+	}
+	svr.rc.NatHoleController = nc
 
 	var statsEnable bool
 	// Create dashboard web server.
@@ -350,7 +350,7 @@ func (svr *Service) Run(ctx context.Context) {
 	// service context may not be canceled by svr.Close(), we should call it here to release resources
 	if svr.listener != nil {
 		svr.Close()
-}
+	}
 }
 
 func (svr *Service) Close() error {

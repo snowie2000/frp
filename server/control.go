@@ -23,6 +23,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fatedier/golib/control/shutdown"
+	"github.com/fatedier/golib/crypto"
+	"github.com/fatedier/golib/errors"
+
 	"github.com/fatedier/frp/pkg/auth"
 	"github.com/fatedier/frp/pkg/config"
 	pkgerr "github.com/fatedier/frp/pkg/errors"
@@ -35,9 +39,6 @@ import (
 	"github.com/fatedier/frp/server/controller"
 	"github.com/fatedier/frp/server/metrics"
 	"github.com/fatedier/frp/server/proxy"
-
-	"github.com/fatedier/golib/control/shutdown"
-	"github.com/fatedier/golib/crypto"
 )
 
 type ControlManager struct {
@@ -200,9 +201,9 @@ func NewControl(
 // Start send a login success message to client and start working.
 func (ctl *Control) Start() {
 	loginRespMsg := &msg.LoginResp{
-		Version:       version.Full(),
-		RunID:         ctl.runID,
-		Error:         "",
+		Version: version.Full(),
+		RunID:   ctl.runID,
+		Error:   "",
 	}
 	_ = msg.WriteMsg(ctl.conn, loginRespMsg)
 	ctl.mu.Lock()
@@ -211,12 +212,12 @@ func (ctl *Control) Start() {
 
 	go ctl.writer()
 	go func() {
-	for i := 0; i < ctl.poolCount; i++ {
+		for i := 0; i < ctl.poolCount; i++ {
 			// ignore error here, that means that this control is closed
 			_ = errors.PanicToError(func() {
-		ctl.sendCh <- &msg.ReqWorkConn{}
+				ctl.sendCh <- &msg.ReqWorkConn{}
 			})
-	}
+		}
 	}()
 
 	go ctl.manager()
@@ -270,24 +271,11 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	// get a work connection from the pool
 	workConn, ok = ctl.workConnMgr.GetConn()
 	if !ok {
-			err = pkgerr.ErrCtlClosed
+		err = pkgerr.ErrCtlClosed
 		return
 	}
 	xl.Debug("get work connection from pool")
-	default:
-		// no work connections available in the poll, send message to frpc to get more
-		if err = errors.PanicToError(func() {
-			ctl.sendCh <- &msg.ReqWorkConn{}
-		}); err != nil {
-			return nil, fmt.Errorf("control is already closed")
-		}
-
-		select {
-		case workConn, ok = <-ctl.workConnCh:
-			if !ok {
-				err = pkgerr.ErrCtlClosed
-				xl.Warn("no work connections available, %v", err)
-				return
+	return
 }
 
 func (ctl *Control) writer() {
@@ -427,8 +415,8 @@ func (ctl *Control) manager() {
 	defer ctl.managerShutdown.Done()
 
 	var heartbeatCh <-chan time.Time
-		// Don't need application heartbeat here.
-		// yamux will do same thing.
+	// Don't need application heartbeat here.
+	// yamux will do same thing.
 	if !ctl.serverCfg.TCPMux && ctl.serverCfg.HeartbeatTimeout > 0 {
 		heartbeat := time.NewTicker(time.Second)
 		defer heartbeat.Stop()
