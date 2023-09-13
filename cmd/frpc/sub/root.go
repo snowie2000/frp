@@ -15,6 +15,7 @@
 package sub
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"net"
@@ -53,27 +54,31 @@ var (
 	logFile         string
 	logMaxDays      int
 	disableLogColor bool
+	dnsServer       string
 
-	proxyName         string
-	localIP           string
-	localPort         int
-	remotePort        int
-	useEncryption     bool
-	useCompression    bool
-	customDomains     string
-	subDomain         string
-	httpUser          string
-	httpPwd           string
-	locations         string
-	hostHeaderRewrite string
-	role              string
-	sk                string
-	multiplexer       string
-	serverName        string
-	bindAddr          string
-	bindPort          int
+	proxyName          string
+	localIP            string
+	localPort          int
+	remotePort         int
+	useEncryption      bool
+	useCompression     bool
+	bandwidthLimit     string
+	bandwidthLimitMode string
+	customDomains      string
+	subDomain          string
+	httpUser           string
+	httpPwd            string
+	locations          string
+	hostHeaderRewrite  string
+	role               string
+	sk                 string
+	multiplexer        string
+	serverName         string
+	bindAddr           string
+	bindPort           int
 
-	tlsEnable bool
+	tlsEnable     bool
+	tlsServerName string
 )
 
 func init() {
@@ -85,13 +90,15 @@ func init() {
 func RegisterCommonFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVarP(&serverAddr, "server_addr", "s", "127.0.0.1:7000", "frp server's address")
 	cmd.PersistentFlags().StringVarP(&user, "user", "u", "", "user")
-	cmd.PersistentFlags().StringVarP(&protocol, "protocol", "p", "tcp", "tcp or kcp or websocket")
+	cmd.PersistentFlags().StringVarP(&protocol, "protocol", "p", "tcp", "tcp, kcp, quic, websocket, wss")
 	cmd.PersistentFlags().StringVarP(&token, "token", "t", "", "auth token")
 	cmd.PersistentFlags().StringVarP(&logLevel, "log_level", "", "info", "log level")
 	cmd.PersistentFlags().StringVarP(&logFile, "log_file", "", "console", "console or file path")
 	cmd.PersistentFlags().IntVarP(&logMaxDays, "log_max_days", "", 3, "log file reversed days")
 	cmd.PersistentFlags().BoolVarP(&disableLogColor, "disable_log_color", "", false, "disable log color in console")
-	cmd.PersistentFlags().BoolVarP(&tlsEnable, "tls_enable", "", false, "enable frpc tls")
+	cmd.PersistentFlags().BoolVarP(&tlsEnable, "tls_enable", "", true, "enable frpc tls")
+	cmd.PersistentFlags().StringVarP(&tlsServerName, "tls_server_name", "", "", "specify the custom server name of tls certificate")
+	cmd.PersistentFlags().StringVarP(&dnsServer, "dns_server", "", "", "specify dns server instead of using system default one")
 }
 
 var rootCmd = &cobra.Command{
@@ -106,37 +113,38 @@ var rootCmd = &cobra.Command{
 		// If cfgDir is not empty, run multiple frpc service for each config file in cfgDir.
 		// Note that it's only designed for testing. It's not guaranteed to be stable.
 		if cfgDir != "" {
-			var wg sync.WaitGroup
-			_ = filepath.WalkDir(cfgDir, func(path string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return nil
-				}
-				if d.IsDir() {
-					return nil
-				}
-				wg.Add(1)
-				time.Sleep(time.Millisecond)
-				go func() {
-					defer wg.Done()
-					err := runClient(path)
-					if err != nil {
-						fmt.Printf("frpc service error for config file [%s]\n", path)
-					}
-				}()
-				return nil
-			})
-			wg.Wait()
+			_ = runMultipleClients(cfgDir)
 			return nil
 		}
 
 		// Do not show command usage here.
 		err := runClient(cfgFile)
 		if err != nil {
-			fmt.Println(err)
 			os.Exit(1)
 		}
 		return nil
 	},
+}
+
+func runMultipleClients(cfgDir string) error {
+	var wg sync.WaitGroup
+	err := filepath.WalkDir(cfgDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		wg.Add(1)
+		time.Sleep(time.Millisecond)
+		go func() {
+			defer wg.Done()
+			err := runClient(path)
+			if err != nil {
+				fmt.Printf("frpc service error for config file [%s]\n", path)
+			}
+		}()
+		return nil
+	})
+	wg.Wait()
+	return err
 }
 
 func Execute() {
@@ -145,12 +153,11 @@ func Execute() {
 	}
 }
 
-func handleSignal(svr *client.Service, doneCh chan struct{}) {
+func handleTermSignal(svr *client.Service) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 	svr.GracefulClose(500 * time.Millisecond)
-	close(doneCh)
 }
 
 func parseClientCommonCfgFromCmd() (cfg config.ClientCommonConf, err error) {
@@ -175,11 +182,13 @@ func parseClientCommonCfgFromCmd() (cfg config.ClientCommonConf, err error) {
 	cfg.LogFile = logFile
 	cfg.LogMaxDays = int64(logMaxDays)
 	cfg.DisableLogColor = disableLogColor
+	cfg.DNSServer = dnsServer
 
 	// Only token authentication is supported in cmd mode
 	cfg.ClientConfig = auth.GetDefaultClientConf()
 	cfg.Token = token
 	cfg.TLSEnable = tlsEnable
+	cfg.TLSServerName = tlsServerName
 
 	cfg.Complete()
 	if err = cfg.Validate(); err != nil {
@@ -192,6 +201,7 @@ func parseClientCommonCfgFromCmd() (cfg config.ClientCommonConf, err error) {
 func runClient(cfgFilePath string) error {
 	cfg, pxyCfgs, visitorCfgs, err := config.ParseClientConfig(cfgFilePath)
 	if err != nil {
+		fmt.Println(err)
 		return err
 	}
 	return startService(cfg, pxyCfgs, visitorCfgs, cfgFilePath)
@@ -207,8 +217,8 @@ func startService(
 		cfg.LogMaxDays, cfg.DisableLogColor)
 
 	if cfgFile != "" {
-		log.Trace("start frpc service for config file [%s]", cfgFile)
-		defer log.Trace("frpc service for config file [%s] stopped", cfgFile)
+		log.Info("start frpc service for config file [%s]", cfgFile)
+		defer log.Info("frpc service for config file [%s] stopped", cfgFile)
 	}
 	svr, errRet := client.NewService(cfg, pxyCfgs, visitorCfgs, cfgFile)
 	if errRet != nil {
@@ -216,15 +226,12 @@ func startService(
 		return
 	}
 
-	kcpDoneCh := make(chan struct{})
-	// Capture the exit signal if we use kcp.
-	if cfg.Protocol == "kcp" {
-		go handleSignal(svr, kcpDoneCh)
+	shouldGracefulClose := cfg.Protocol == "kcp" || cfg.Protocol == "quic"
+	// Capture the exit signal if we use kcp or quic.
+	if shouldGracefulClose {
+		go handleTermSignal(svr)
 	}
 
-	err = svr.Run()
-	if err == nil && cfg.Protocol == "kcp" {
-		<-kcpDoneCh
-	}
+	_ = svr.Run(context.Background())
 	return
 }

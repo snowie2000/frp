@@ -38,14 +38,18 @@ type ServerCommonConf struct {
 	// BindPort specifies the port that the server listens on. By default, this
 	// value is 7000.
 	BindPort int `ini:"bind_port" json:"bind_port" validate:"gte=0,lte=65535"`
-	// BindUDPPort specifies the UDP port that the server listens on. If this
-	// value is 0, the server will not listen for UDP connections. By default,
-	// this value is 0
-	BindUDPPort int `ini:"bind_udp_port" json:"bind_udp_port" validate:"gte=0,lte=65535"`
 	// KCPBindPort specifies the KCP port that the server listens on. If this
 	// value is 0, the server will not listen for KCP connections. By default,
 	// this value is 0.
 	KCPBindPort int `ini:"kcp_bind_port" json:"kcp_bind_port" validate:"gte=0,lte=65535"`
+	// QUICBindPort specifies the QUIC port that the server listens on.
+	// Set this value to 0 will disable this feature.
+	// By default, the value is 0.
+	QUICBindPort int `ini:"quic_bind_port" json:"quic_bind_port" validate:"gte=0,lte=65535"`
+	// QUIC protocol options
+	QUICKeepalivePeriod    int `ini:"quic_keepalive_period" json:"quic_keepalive_period" validate:"gte=0"`
+	QUICMaxIdleTimeout     int `ini:"quic_max_idle_timeout" json:"quic_max_idle_timeout" validate:"gte=0"`
+	QUICMaxIncomingStreams int `ini:"quic_max_incoming_streams" json:"quic_max_incoming_streams" validate:"gte=0"`
 	// ProxyBindAddr specifies the address that the proxy binds to. This value
 	// may be the same as BindAddr.
 	ProxyBindAddr string `ini:"proxy_bind_addr" json:"proxy_bind_addr"`
@@ -146,6 +150,8 @@ type ServerCommonConf struct {
 	// If the length of this value is 0, all ports are allowed. By default,
 	// this value is an empty set.
 	AllowPorts map[int]struct{} `ini:"-" json:"-"`
+	// Original string.
+	AllowPortsStr string `ini:"-" json:"-"`
 	// MaxPoolCount specifies the maximum pool size for each proxy. By default,
 	// this value is 5.
 	MaxPoolCount int64 `ini:"max_pool_count" json:"max_pool_count"`
@@ -186,52 +192,38 @@ type ServerCommonConf struct {
 	// Enable golang pprof handlers in dashboard listener.
 	// Dashboard port must be set first.
 	PprofEnable bool `ini:"pprof_enable" json:"pprof_enable"`
+	// NatHoleAnalysisDataReserveHours specifies the hours to reserve nat hole analysis data.
+	NatHoleAnalysisDataReserveHours int64 `ini:"nat_hole_analysis_data_reserve_hours" json:"nat_hole_analysis_data_reserve_hours"`
 }
 
 // GetDefaultServerConf returns a server configuration with reasonable
 // defaults.
 func GetDefaultServerConf() ServerCommonConf {
 	return ServerCommonConf{
-		ServerConfig:            auth.GetDefaultServerConf(),
-		BindAddr:                "0.0.0.0",
-		BindPort:                7000,
-		BindUDPPort:             0,
-		KCPBindPort:             0,
-		ProxyBindAddr:           "",
-		VhostHTTPPort:           0,
-		VhostHTTPSPort:          0,
-		TCPMuxHTTPConnectPort:   0,
-		TCPMuxPassthrough:       false,
-		VhostHTTPTimeout:        60,
-		DashboardAddr:           "0.0.0.0",
-		DashboardPort:           0,
-		DashboardUser:           "",
-		DashboardPwd:            "",
-		EnablePrometheus:        false,
-		AssetsDir:               "",
-		LogFile:                 "console",
-		LogWay:                  "console",
-		LogLevel:                "info",
-		LogMaxDays:              3,
-		DisableLogColor:         false,
-		DetailedErrorsToClient:  true,
-		SubDomainHost:           "",
-		TCPMux:                  true,
-		TCPMuxKeepaliveInterval: 60,
-		TCPKeepAlive:            7200,
-		AllowPorts:              make(map[int]struct{}),
-		MaxPoolCount:            5,
-		MaxPortsPerClient:       0,
-		TLSOnly:                 false,
-		TLSCertFile:             "",
-		TLSKeyFile:              "",
-		TLSTrustedCaFile:        "",
-		HeartbeatTimeout:        90,
-		UserConnTimeout:         10,
-		Custom404Page:           "",
-		HTTPPlugins:             make(map[string]plugin.HTTPPluginOptions),
-		UDPPacketSize:           1500,
-		PprofEnable:             false,
+		ServerConfig:                    auth.GetDefaultServerConf(),
+		BindAddr:                        "0.0.0.0",
+		BindPort:                        7000,
+		QUICKeepalivePeriod:             10,
+		QUICMaxIdleTimeout:              30,
+		QUICMaxIncomingStreams:          100000,
+		VhostHTTPTimeout:                60,
+		DashboardAddr:                   "0.0.0.0",
+		LogFile:                         "console",
+		LogWay:                          "console",
+		LogLevel:                        "info",
+		LogMaxDays:                      3,
+		DetailedErrorsToClient:          true,
+		TCPMux:                          true,
+		TCPMuxKeepaliveInterval:         60,
+		TCPKeepAlive:                    7200,
+		AllowPorts:                      make(map[int]struct{}),
+		MaxPoolCount:                    5,
+		MaxPortsPerClient:               0,
+		HeartbeatTimeout:                90,
+		UserConnTimeout:                 10,
+		HTTPPlugins:                     make(map[string]plugin.HTTPPluginOptions),
+		UDPPacketSize:                   1500,
+		NatHoleAnalysisDataReserveHours: 7 * 24,
 	}
 }
 
@@ -268,6 +260,7 @@ func UnmarshalServerConfFromIni(source interface{}) (ServerCommonConf, error) {
 		for _, port := range allowPorts {
 			common.AllowPorts[int(port)] = struct{}{}
 		}
+		common.AllowPortsStr = allowPortStr
 	}
 
 	// plugin.xxx

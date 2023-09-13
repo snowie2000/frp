@@ -16,33 +16,30 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"runtime/debug"
-	"strconv"
 	"time"
 
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
-	libdial "github.com/fatedier/golib/net/dial"
-	fmux "github.com/libp2p/go-yamux"
 
 	"github.com/fatedier/frp/client/proxy"
+	"github.com/fatedier/frp/client/visitor"
 	"github.com/fatedier/frp/pkg/auth"
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/transport"
-	frpNet "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/xlog"
-
-	"github.com/fatedier/golib/control/shutdown"
-	"github.com/fatedier/golib/crypto"
-	fmux "github.com/libp2p/go-yamux"
 )
 
 type Control struct {
 	// uniq id got from frps, attach it in loginMsg
+	ctx context.Context
+	xl  *xlog.Logger
+
+	// Unique ID obtained from frps.
+	// It should be attached to the login message when reconnecting.
 	runID string
 
 	// manage all proxies
@@ -50,15 +47,14 @@ type Control struct {
 	pm      *proxy.Manager
 
 	// manage all visitors
-	vm *VisitorManager
+	vm *visitor.Manager
 
 	// control connection
 	conn net.Conn
 
+	cm *ConnectionManager
 	// tcp stream multiplexing, if enabled
-	session *fmux.Session
 
-	// put a message in this channel to send it over control connection to server
 	sendCh chan (msg.Message)
 
 	// read from this channel to get the next message sent by server
@@ -80,29 +76,25 @@ type Control struct {
 	msgHandlerShutdown *shutdown.Shutdown
 
 	// The UDP port that the server is listening on
-	serverUDPPort int
-
-	xl *xlog.Logger
-
-	// service context
-	ctx context.Context
-
-	// sets authentication based on selected method
 	authSetter auth.Setter
+
+	msgTransporter transport.MessageTransporter
 }
 
-func NewControl(ctx context.Context, runID string, conn net.Conn, session *fmux.Session,
+func NewControl(
+	ctx context.Context, runID string, conn net.Conn, cm *ConnectionManager,
 	clientCfg config.ClientCommonConf,
 	pxyCfgs map[string]config.ProxyConf,
 	visitorCfgs map[string]config.VisitorConf,
-	serverUDPPort int,
 	authSetter auth.Setter,
 ) *Control {
 	// new xlog instance
 	ctl := &Control{
+		ctx:                ctx,
+		xl:                 xlog.FromContextSafe(ctx),
 		runID:              runID,
 		conn:               conn,
-		session:            session,
+		cm:                 cm,
 		pxyCfgs:            pxyCfgs,
 		sendCh:             make(chan msg.Message, 100),
 		readCh:             make(chan msg.Message, 100),
@@ -112,14 +104,12 @@ func NewControl(ctx context.Context, runID string, conn net.Conn, session *fmux.
 		readerShutdown:     shutdown.New(),
 		writerShutdown:     shutdown.New(),
 		msgHandlerShutdown: shutdown.New(),
-		serverUDPPort:      serverUDPPort,
-		xl:                 xlog.FromContextSafe(ctx),
-		ctx:                ctx,
 		authSetter:         authSetter,
 	}
-	ctl.pm = proxy.NewManager(ctl.ctx, ctl.sendCh, clientCfg, serverUDPPort)
+	ctl.msgTransporter = transport.NewMessageTransporter(ctl.sendCh)
+	ctl.pm = proxy.NewManager(ctl.ctx, clientCfg, ctl.msgTransporter)
 
-	ctl.vm = NewVisitorManager(ctl.ctx, ctl)
+	ctl.vm = visitor.NewManager(ctl.ctx, ctl.runID, ctl.clientCfg, ctl.connectServer, ctl.msgTransporter)
 	ctl.vm.Reload(visitorCfgs)
 	return ctl
 }
@@ -134,10 +124,11 @@ func (ctl *Control) Run() {
 	go ctl.vm.Run()
 }
 
-func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
+func (ctl *Control) HandleReqWorkConn(_ *msg.ReqWorkConn) {
 	xl := ctl.xl
 	workConn, err := ctl.connectServer()
 	if err != nil {
+		xl.Warn("start new connection to server error: %v", err)
 		return
 	}
 
@@ -156,7 +147,7 @@ func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
 
 	var startMsg msg.StartWorkConn
 	if err = msg.ReadMsgInto(workConn, &startMsg); err != nil {
-		xl.Error("work connection closed before response StartWorkConn message: %v", err)
+		xl.Trace("work connection closed before response StartWorkConn message: %v", err)
 		workConn.Close()
 		return
 	}
@@ -182,6 +173,16 @@ func (ctl *Control) HandleNewProxyResp(inMsg *msg.NewProxyResp) {
 	}
 }
 
+func (ctl *Control) HandleNatHoleResp(inMsg *msg.NatHoleResp) {
+	xl := ctl.xl
+
+	// Dispatch the NatHoleResp message to the related proxy.
+	ok := ctl.msgTransporter.DispatchWithType(inMsg, msg.TypeNameNatHoleResp, inMsg.TransactionID)
+	if !ok {
+		xl.Trace("dispatch NatHoleResp message to related proxy error")
+	}
+}
+
 func (ctl *Control) Close() error {
 	return ctl.GracefulClose(0)
 }
@@ -193,9 +194,7 @@ func (ctl *Control) GracefulClose(d time.Duration) error {
 	time.Sleep(d)
 
 	ctl.conn.Close()
-	if ctl.session != nil {
-		ctl.session.Close()
-	}
+	ctl.cm.Close()
 	return nil
 }
 
@@ -206,73 +205,9 @@ func (ctl *Control) ClosedDoneCh() <-chan struct{} {
 
 // connectServer return a new connection to frps
 func (ctl *Control) connectServer() (conn net.Conn, err error) {
-	xl := ctl.xl
-	if ctl.clientCfg.TCPMux {
-		stream, errRet := ctl.session.OpenStream()
-		if errRet != nil {
-			err = errRet
-			xl.Warn("start new connection to server error: %v", err)
-			return
-		}
-		conn = stream
-	} else {
-		var tlsConfig *tls.Config
-		sn := ctl.clientCfg.TLSServerName
-		if sn == "" {
-			sn = ctl.clientCfg.ServerAddr
-		}
-
-		if ctl.clientCfg.TLSEnable {
-			tlsConfig, err = transport.NewClientTLSConfig(
-				ctl.clientCfg.TLSCertFile,
-				ctl.clientCfg.TLSKeyFile,
-				ctl.clientCfg.TLSTrustedCaFile,
-				sn)
-
-			if err != nil {
-				xl.Warn("fail to build tls configuration when connecting to server, err: %v", err)
-				return
-			}
-		}
-
-		proxyType, addr, auth, err := libdial.ParseProxyURL(ctl.clientCfg.HTTPProxy)
-		if err != nil {
-			xl.Error("fail to parse proxy url")
-			return nil, err
-		}
-		dialOptions := []libdial.DialOption{}
-		protocol := ctl.clientCfg.Protocol
-		if protocol == "websocket" {
-			protocol = "tcp"
-			dialOptions = append(dialOptions, libdial.WithAfterHook(libdial.AfterHook{Hook: frpNet.DialHookWebsocket()}))
-		}
-		if ctl.clientCfg.ConnectServerLocalIP != "" {
-			dialOptions = append(dialOptions, libdial.WithLocalAddr(ctl.clientCfg.ConnectServerLocalIP))
-		}
-		dialOptions = append(dialOptions,
-			libdial.WithProtocol(protocol),
-			libdial.WithTimeout(time.Duration(ctl.clientCfg.DialServerTimeout)*time.Second),
-			libdial.WithKeepAlive(time.Duration(ctl.clientCfg.DialServerKeepAlive)*time.Second),
-			libdial.WithProxy(proxyType, addr),
-			libdial.WithProxyAuth(auth),
-			libdial.WithTLSConfig(tlsConfig),
-			libdial.WithAfterHook(libdial.AfterHook{
-				Hook: frpNet.DialHookCustomTLSHeadByte(tlsConfig != nil, ctl.clientCfg.DisableCustomTLSFirstByte),
-			}),
-		)
-		conn, err = libdial.Dial(
-			net.JoinHostPort(ctl.clientCfg.ServerAddr, strconv.Itoa(ctl.clientCfg.ServerPort)),
-			dialOptions...,
-		)
-		if err != nil {
-			xl.Warn("start new connection to server error: %v", err)
-			return nil, err
-		}
-	}
-	return
+	return ctl.cm.Connect()
 }
 
-// reader read all messages from frps and send to readCh
 func (ctl *Control) reader() {
 	xl := ctl.xl
 	defer func() {
@@ -381,6 +316,8 @@ func (ctl *Control) msgHandler() {
 				go ctl.HandleReqWorkConn(m)
 			case *msg.NewProxyResp:
 				ctl.HandleNewProxyResp(m)
+			case *msg.NatHoleResp:
+				ctl.HandleNatHoleResp(m)
 			case *msg.Pong:
 				if m.Error != "" {
 					xl.Error("Pong contains error: %s", m.Error)
@@ -413,9 +350,7 @@ func (ctl *Control) worker() {
 	ctl.vm.Close()
 
 	close(ctl.closedDoneCh)
-	if ctl.session != nil {
-		ctl.session.Close()
-	}
+	ctl.cm.Close()
 }
 
 func (ctl *Control) ReloadConf(pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) error {

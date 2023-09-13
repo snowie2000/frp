@@ -25,10 +25,10 @@ import (
 
 	"github.com/fatedier/frp/pkg/auth"
 	"github.com/fatedier/frp/pkg/config"
-	"github.com/fatedier/frp/pkg/consts"
-	frpErr "github.com/fatedier/frp/pkg/errors"
+	pkgerr "github.com/fatedier/frp/pkg/errors"
 	"github.com/fatedier/frp/pkg/msg"
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
+	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/version"
 	"github.com/fatedier/frp/pkg/util/xlog"
@@ -53,13 +53,14 @@ func NewControlManager() *ControlManager {
 	}
 }
 
-func (cm *ControlManager) Add(runID string, ctl *Control) (oldCtl *Control) {
+func (cm *ControlManager) Add(runID string, ctl *Control) (old *Control) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	oldCtl, ok := cm.ctlsByRunID[runID]
+	var ok bool
+	old, ok = cm.ctlsByRunID[runID]
 	if ok {
-		oldCtl.Replaced(ctl)
+		old.Replaced(ctl)
 	}
 	cm.ctlsByRunID[runID] = ctl
 	return
@@ -81,6 +82,16 @@ func (cm *ControlManager) GetByID(runID string) (ctl *Control, ok bool) {
 	return
 }
 
+func (cm *ControlManager) Close() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for _, ctl := range cm.ctlsByRunID {
+		ctl.Close()
+	}
+	cm.ctlsByRunID = make(map[string]*Control)
+	return nil
+}
+
 type Control struct {
 	// all resource managers and controllers
 	rc *controller.ResourceController
@@ -93,6 +104,9 @@ type Control struct {
 
 	// verifies authentication based on selected method
 	authVerifier auth.Verifier
+
+	// login message
+	msgTransporter transport.MessageTransporter
 
 	// login message
 	loginMsg *msg.Login
@@ -126,13 +140,12 @@ type Control struct {
 	// replace old controller instantly.
 	runID string
 
-	// control status
-	status string
-
 	readerShutdown  *shutdown.Shutdown
 	writerShutdown  *shutdown.Shutdown
 	managerShutdown *shutdown.Shutdown
 	allShutdown     *shutdown.Shutdown
+
+	started bool
 
 	mu sync.RWMutex
 
@@ -171,7 +184,6 @@ func NewControl(
 		portsUsedNum:    0,
 		lastPing:        time.Now(),
 		runID:           loginMsg.RunID,
-		status:          consts.Working,
 		readerShutdown:  shutdown.New(),
 		writerShutdown:  shutdown.New(),
 		managerShutdown: shutdown.New(),
@@ -181,6 +193,7 @@ func NewControl(
 		ctx:             ctx,
 	}
 	ctl.workConnMgr = NewKeeper(poolCount, ctl.sendCh, ctl.serverCfg.UserConnTimeout, ctl.xl)
+	ctl.msgTransporter = transport.NewMessageTransporter(ctl.sendCh)
 	return ctl
 }
 
@@ -189,19 +202,38 @@ func (ctl *Control) Start() {
 	loginRespMsg := &msg.LoginResp{
 		Version:       version.Full(),
 		RunID:         ctl.runID,
-		ServerUDPPort: ctl.serverCfg.BindUDPPort,
 		Error:         "",
 	}
 	_ = msg.WriteMsg(ctl.conn, loginRespMsg)
+	ctl.mu.Lock()
+	ctl.started = true
+	ctl.mu.Unlock()
 
 	go ctl.writer()
+	go func() {
 	for i := 0; i < ctl.poolCount; i++ {
+			// ignore error here, that means that this control is closed
+			_ = errors.PanicToError(func() {
 		ctl.sendCh <- &msg.ReqWorkConn{}
+			})
 	}
+	}()
 
 	go ctl.manager()
 	go ctl.reader()
 	go ctl.stoper()
+}
+
+func (ctl *Control) Close() error {
+	ctl.allShutdown.Start()
+	return nil
+}
+
+func (ctl *Control) Replaced(newCtl *Control) {
+	xl := ctl.xl
+	xl.Info("Replaced by client [%s]", newCtl.runID)
+	ctl.runID = ""
+	ctl.allShutdown.Start()
 }
 
 func (ctl *Control) RegisterWorkConn(conn net.Conn) error {
@@ -238,18 +270,24 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	// get a work connection from the pool
 	workConn, ok = ctl.workConnMgr.GetConn()
 	if !ok {
-		err = frpErr.ErrCtlClosed
+			err = pkgerr.ErrCtlClosed
 		return
 	}
 	xl.Debug("get work connection from pool")
-	return
-}
+	default:
+		// no work connections available in the poll, send message to frpc to get more
+		if err = errors.PanicToError(func() {
+			ctl.sendCh <- &msg.ReqWorkConn{}
+		}); err != nil {
+			return nil, fmt.Errorf("control is already closed")
+		}
 
-func (ctl *Control) Replaced(newCtl *Control) {
-	xl := ctl.xl
-	xl.Info("Replaced by client [%s]", newCtl.runID)
-	ctl.runID = ""
-	ctl.allShutdown.Start()
+		select {
+		case workConn, ok = <-ctl.workConnCh:
+			if !ok {
+				err = pkgerr.ErrCtlClosed
+				xl.Warn("no work connections available, %v", err)
+				return
 }
 
 func (ctl *Control) writer() {
@@ -341,7 +379,7 @@ func (ctl *Control) stoper() {
 	for _, pxy := range ctl.proxies {
 		pxy.Close()
 		ctl.pxyManager.Del(pxy.GetName())
-		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
+		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseConfig().ProxyType)
 
 		notifyContent := &plugin.CloseProxyContent{
 			User: plugin.UserInfo{
@@ -365,6 +403,14 @@ func (ctl *Control) stoper() {
 
 // block until Control closed
 func (ctl *Control) WaitClosed() {
+	ctl.mu.RLock()
+	started := ctl.started
+	ctl.mu.RUnlock()
+
+	if !started {
+		ctl.allShutdown.Done()
+		return
+	}
 	ctl.allShutdown.WaitDone()
 }
 
@@ -381,10 +427,9 @@ func (ctl *Control) manager() {
 	defer ctl.managerShutdown.Done()
 
 	var heartbeatCh <-chan time.Time
-	if ctl.serverCfg.TCPMux || ctl.serverCfg.HeartbeatTimeout <= 0 {
 		// Don't need application heartbeat here.
 		// yamux will do same thing.
-	} else {
+	if !ctl.serverCfg.TCPMux && ctl.serverCfg.HeartbeatTimeout > 0 {
 		heartbeat := time.NewTicker(time.Second)
 		defer heartbeat.Stop()
 		heartbeatCh = heartbeat.C
@@ -432,6 +477,12 @@ func (ctl *Control) manager() {
 					metrics.Server.NewProxy(m.ProxyName, m.ProxyType)
 				}
 				ctl.sendCh <- resp
+			case *msg.NatHoleVisitor:
+				go ctl.HandleNatHoleVisitor(m)
+			case *msg.NatHoleClient:
+				go ctl.HandleNatHoleClient(m)
+			case *msg.NatHoleReport:
+				go ctl.HandleNatHoleReport(m)
 			case *msg.CloseProxy:
 				_ = ctl.CloseProxy(m)
 				xl.Info("close proxy [%s] success", m.ProxyName)
@@ -463,6 +514,18 @@ func (ctl *Control) manager() {
 	}
 }
 
+func (ctl *Control) HandleNatHoleVisitor(m *msg.NatHoleVisitor) {
+	ctl.rc.NatHoleController.HandleVisitor(m, ctl.msgTransporter, ctl.loginMsg.User)
+}
+
+func (ctl *Control) HandleNatHoleClient(m *msg.NatHoleClient) {
+	ctl.rc.NatHoleController.HandleClient(m, ctl.msgTransporter)
+}
+
+func (ctl *Control) HandleNatHoleReport(m *msg.NatHoleReport) {
+	ctl.rc.NatHoleController.HandleReport(m)
+}
+
 func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
 	var pxyConf config.ProxyConf
 	// Load configures from NewProxy message and check.
@@ -480,7 +543,7 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 
 	// NewProxy will return a interface Proxy.
 	// In fact it create different proxies by different proxy type, we just call run() here.
-	pxy, err := proxy.NewProxy(ctl.ctx, userInfo, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg)
+	pxy, err := proxy.NewProxy(ctl.ctx, userInfo, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg, ctl.loginMsg)
 	if err != nil {
 		return remoteAddr, err
 	}
@@ -503,6 +566,11 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 				ctl.mu.Unlock()
 			}
 		}()
+	}
+
+	if ctl.pxyManager.Exist(pxyMsg.ProxyName) {
+		err = fmt.Errorf("proxy [%s] already exists", pxyMsg.ProxyName)
+		return
 	}
 
 	remoteAddr, err = pxy.Run()
@@ -542,7 +610,7 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseInfo().ProxyType)
+	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseConfig().ProxyType)
 
 	notifyContent := &plugin.CloseProxyContent{
 		User: plugin.UserInfo{

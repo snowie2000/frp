@@ -19,24 +19,30 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/fatedier/golib/errors"
-	frpIo "github.com/fatedier/golib/io"
+	libio "github.com/fatedier/golib/io"
 
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/proto/udp"
-	frpNet "github.com/fatedier/frp/pkg/util/net"
+	"github.com/fatedier/frp/pkg/util/limit"
+	utilnet "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/server/metrics"
 )
+
+func init() {
+	RegisterProxyFactory(reflect.TypeOf(&config.UDPProxyConf{}), NewUDPProxy)
+}
 
 type UDPProxy struct {
 	*BaseProxy
 	cfg *config.UDPProxyConf
 
-	realPort int
+	realBindPort int
 
 	// udpConn is the listener of udp packages
 	udpConn *net.UDPConn
@@ -57,21 +63,33 @@ type UDPProxy struct {
 	isClosed bool
 }
 
+func NewUDPProxy(baseProxy *BaseProxy, cfg config.ProxyConf) Proxy {
+	unwrapped, ok := cfg.(*config.UDPProxyConf)
+	if !ok {
+		return nil
+	}
+	baseProxy.usedPortsNum = 1
+	return &UDPProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
+}
+
 func (pxy *UDPProxy) Run() (remoteAddr string, err error) {
 	xl := pxy.xl
-	pxy.realPort, err = pxy.rc.UDPPortManager.Acquire(pxy.name, pxy.cfg.RemotePort)
+	pxy.realBindPort, err = pxy.rc.UDPPortManager.Acquire(pxy.name, pxy.cfg.RemotePort)
 	if err != nil {
 		return "", fmt.Errorf("acquire port %d error: %v", pxy.cfg.RemotePort, err)
 	}
 	defer func() {
 		if err != nil {
-			pxy.rc.UDPPortManager.Release(pxy.realPort)
+			pxy.rc.UDPPortManager.Release(pxy.realBindPort)
 		}
 	}()
 
-	remoteAddr = fmt.Sprintf(":%d", pxy.realPort)
-	pxy.cfg.RemotePort = pxy.realPort
-	addr, errRet := net.ResolveUDPAddr("udp", net.JoinHostPort(pxy.serverCfg.ProxyBindAddr, strconv.Itoa(pxy.realPort)))
+	remoteAddr = fmt.Sprintf(":%d", pxy.realBindPort)
+	pxy.cfg.RemotePort = pxy.realBindPort
+	addr, errRet := net.ResolveUDPAddr("udp", net.JoinHostPort(pxy.serverCfg.ProxyBindAddr, strconv.Itoa(pxy.realBindPort)))
 	if errRet != nil {
 		err = errRet
 		return
@@ -122,7 +140,7 @@ func (pxy *UDPProxy) Run() (remoteAddr string, err error) {
 					pxy.readCh <- m
 					metrics.Server.AddTrafficOut(
 						pxy.GetName(),
-						pxy.GetConf().GetBaseInfo().ProxyType,
+						pxy.GetConf().GetBaseConfig().ProxyType,
 						int64(len(m.Content)),
 					)
 				}); errRet != nil {
@@ -152,7 +170,7 @@ func (pxy *UDPProxy) Run() (remoteAddr string, err error) {
 				xl.Trace("send message to udp workConn: %s", udpMsg.Content)
 				metrics.Server.AddTrafficIn(
 					pxy.GetName(),
-					pxy.GetConf().GetBaseInfo().ProxyType,
+					pxy.GetConf().GetBaseConfig().ProxyType,
 					int64(len(udpMsg.Content)),
 				)
 				continue
@@ -187,7 +205,7 @@ func (pxy *UDPProxy) Run() (remoteAddr string, err error) {
 
 			var rwc io.ReadWriteCloser = workConn
 			if pxy.cfg.UseEncryption {
-				rwc, err = frpIo.WithEncryption(rwc, []byte(pxy.serverCfg.Token))
+				rwc, err = libio.WithEncryption(rwc, []byte(pxy.serverCfg.Token))
 				if err != nil {
 					xl.Error("create encryption stream error: %v", err)
 					workConn.Close()
@@ -195,10 +213,16 @@ func (pxy *UDPProxy) Run() (remoteAddr string, err error) {
 				}
 			}
 			if pxy.cfg.UseCompression {
-				rwc = frpIo.WithCompression(rwc)
+				rwc = libio.WithCompression(rwc)
 			}
 
-			pxy.workConn = frpNet.WrapReadWriteCloserToConn(rwc, workConn)
+			if pxy.GetLimiter() != nil {
+				rwc = libio.WrapReadWriteCloser(limit.NewReader(rwc, pxy.GetLimiter()), limit.NewWriter(rwc, pxy.GetLimiter()), func() error {
+					return rwc.Close()
+				})
+			}
+
+			pxy.workConn = utilnet.WrapReadWriteCloserToConn(rwc, workConn)
 			ctx, cancel := context.WithCancel(context.Background())
 			go workConnReaderFn(pxy.workConn)
 			go workConnSenderFn(pxy.workConn, ctx)
@@ -242,5 +266,5 @@ func (pxy *UDPProxy) Close() {
 		close(pxy.readCh)
 		close(pxy.sendCh)
 	}
-	pxy.rc.UDPPortManager.Release(pxy.realPort)
+	pxy.rc.UDPPortManager.Release(pxy.realBindPort)
 }

@@ -28,6 +28,7 @@ import (
 
 	"github.com/fatedier/golib/net/mux"
 	fmux "github.com/libp2p/go-yamux"
+	quic "github.com/quic-go/quic-go"
 
 	"github.com/fatedier/frp/assets"
 	"github.com/fatedier/frp/pkg/auth"
@@ -38,7 +39,7 @@ import (
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/log"
-	frpNet "github.com/fatedier/frp/pkg/util/net"
+	utilnet "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/tcpmux"
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/version"
@@ -69,6 +70,9 @@ type Service struct {
 	kcpListener net.Listener
 
 	// Accept connections using websocket
+	quicListener *quic.Listener
+
+	// Accept connections using websocket
 	websocketListener net.Listener
 
 	// Accept frp tls connections
@@ -95,6 +99,11 @@ type Service struct {
 	tlsConfig *tls.Config
 
 	cfg config.ServerCommonConf
+
+	// service context
+	ctx context.Context
+	// call cancel to stop service
+	cancel context.CancelFunc
 }
 
 func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
@@ -119,6 +128,7 @@ func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 		authVerifier:    auth.NewAuthVerifier(cfg.ServerConfig),
 		tlsConfig:       tlsConfig,
 		cfg:             cfg,
+		ctx:             context.Background(),
 	}
 
 	// Create tcpmux httpconnect multiplexer.
@@ -198,20 +208,36 @@ func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 	// Listen for accepting connections from client using kcp protocol.
 	if cfg.KCPBindPort > 0 {
 		address := net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.KCPBindPort))
-		svr.kcpListener, err = frpNet.ListenKcp(address)
+		svr.kcpListener, err = utilnet.ListenKcp(address)
 		if err != nil {
-			err = fmt.Errorf("listen on kcp address udp %s error: %v", address, err)
+			err = fmt.Errorf("listen on kcp udp address %s error: %v", address, err)
 			return
 		}
 		log.Info("frps kcp listen on udp %s", address)
 	}
 
+	if cfg.QUICBindPort > 0 {
+		address := net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.QUICBindPort))
+		quicTLSCfg := tlsConfig.Clone()
+		quicTLSCfg.NextProtos = []string{"frp"}
+		svr.quicListener, err = quic.ListenAddr(address, quicTLSCfg, &quic.Config{
+			MaxIdleTimeout:     time.Duration(cfg.QUICMaxIdleTimeout) * time.Second,
+			MaxIncomingStreams: int64(cfg.QUICMaxIncomingStreams),
+			KeepAlivePeriod:    time.Duration(cfg.QUICKeepalivePeriod) * time.Second,
+		})
+		if err != nil {
+			err = fmt.Errorf("listen on quic udp address %s error: %v", address, err)
+			return
+		}
+		log.Info("frps quic listen on quic %s", address)
+	}
 	// Listen for accepting connections from client using websocket protocol.
-	websocketPrefix := []byte("GET " + frpNet.FrpWebsocketPath)
+	// Listen for accepting connections from client using websocket protocol.
+	websocketPrefix := []byte("GET " + utilnet.FrpWebsocketPath)
 	websocketLn := svr.muxer.Listen(0, uint32(len(websocketPrefix)), func(data []byte) bool {
 		return bytes.Equal(data, websocketPrefix)
 	})
-	svr.websocketListener = frpNet.NewWebsocketListener(websocketLn)
+	svr.websocketListener = utilnet.NewWebsocketListener(websocketLn)
 
 	// Create http vhost muxer.
 	if cfg.VhostHTTPPort > 0 {
@@ -266,21 +292,16 @@ func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 	// frp tls listener
 	svr.tlsListener = svr.muxer.Listen(2, 1, func(data []byte) bool {
 		// tls first byte can be 0x16 only when vhost https port is not same with bind port
-		return int(data[0]) == frpNet.FRPTLSHeadByte || int(data[0]) == 0x16
+		return int(data[0]) == utilnet.FRPTLSHeadByte || int(data[0]) == 0x16
 	})
 
 	// Create nat hole controller.
-	if cfg.BindUDPPort > 0 {
-		var nc *nathole.Controller
-		address := net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.BindUDPPort))
-		nc, err = nathole.NewController(address)
+	nc, err := nathole.NewController(time.Duration(cfg.NatHoleAnalysisDataReserveHours) * time.Hour)
 		if err != nil {
 			err = fmt.Errorf("create nat hole controller error, %v", err)
 			return
 		}
 		svr.rc.NatHoleController = nc
-		log.Info("nat hole udp service listen on %s", address)
-	}
 
 	var statsEnable bool
 	// Create dashboard web server.
@@ -306,18 +327,58 @@ func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 	return
 }
 
-func (svr *Service) Run() {
-	if svr.rc.NatHoleController != nil {
-		go svr.rc.NatHoleController.Run()
-	}
-	if svr.cfg.KCPBindPort > 0 {
+func (svr *Service) Run(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	svr.ctx = ctx
+	svr.cancel = cancel
+
+	if svr.kcpListener != nil {
 		go svr.HandleListener(svr.kcpListener)
 	}
-
+	if svr.quicListener != nil {
+		go svr.HandleQUICListener(svr.quicListener)
+	}
 	go svr.HandleListener(svr.websocketListener)
 	go svr.HandleListener(svr.tlsListener)
 
+	if svr.rc.NatHoleController != nil {
+		go svr.rc.NatHoleController.CleanWorker(svr.ctx)
+	}
 	svr.HandleListener(svr.listener)
+
+	<-svr.ctx.Done()
+	// service context may not be canceled by svr.Close(), we should call it here to release resources
+	if svr.listener != nil {
+		svr.Close()
+}
+}
+
+func (svr *Service) Close() error {
+	if svr.kcpListener != nil {
+		svr.kcpListener.Close()
+		svr.kcpListener = nil
+	}
+	if svr.quicListener != nil {
+		svr.quicListener.Close()
+		svr.quicListener = nil
+	}
+	if svr.websocketListener != nil {
+		svr.websocketListener.Close()
+		svr.websocketListener = nil
+	}
+	if svr.tlsListener != nil {
+		svr.tlsListener.Close()
+		svr.tlsConfig = nil
+	}
+	if svr.listener != nil {
+		svr.listener.Close()
+		svr.listener = nil
+	}
+	svr.ctlManager.Close()
+	if svr.cancel != nil {
+		svr.cancel()
+	}
+	return nil
 }
 
 func (svr *Service) handleConnection(ctx context.Context, conn net.Conn) {
@@ -396,12 +457,12 @@ func (svr *Service) HandleListener(l net.Listener) {
 		xl := xlog.New()
 		ctx := context.Background()
 
-		c = frpNet.NewContextConn(xlog.NewContext(ctx, xl), c)
+		c = utilnet.NewContextConn(xlog.NewContext(ctx, xl), c)
 
 		log.Trace("start check TLS connection...")
 		originConn := c
 		var isTLS, custom bool
-		c, isTLS, custom, err = frpNet.CheckAndEnableTLSServerConnWithTimeout(c, svr.tlsConfig, svr.cfg.TLSOnly, connReadTimeout)
+		c, isTLS, custom, err = utilnet.CheckAndEnableTLSServerConnWithTimeout(c, svr.tlsConfig, svr.cfg.TLSOnly, connReadTimeout)
 		if err != nil {
 			log.Warn("CheckAndEnableTLSServerConnWithTimeout error: %v", err)
 			originConn.Close()
@@ -434,6 +495,7 @@ func (svr *Service) HandleListener(l net.Listener) {
 				fmuxCfg := fmux.DefaultConfig()
 				fmuxCfg.KeepAliveInterval = time.Duration(svr.cfg.TCPMuxKeepaliveInterval) * time.Second
 				fmuxCfg.LogOutput = io.Discard
+				fmuxCfg.MaxStreamWindowSize = 6 * 1024 * 1024
 				session, err := fmux.Server(frpConn, fmuxCfg)
 				if err != nil {
 					log.Warn("Failed to create mux connection: %v", err)
@@ -457,6 +519,29 @@ func (svr *Service) HandleListener(l net.Listener) {
 	}
 }
 
+func (svr *Service) HandleQUICListener(l *quic.Listener) {
+	// Listen for incoming connections from client.
+	for {
+		c, err := l.Accept(context.Background())
+		if err != nil {
+			log.Warn("QUICListener for incoming connections from client closed")
+			return
+		}
+		// Start a new goroutine to handle connection.
+		go func(ctx context.Context, frpConn quic.Connection) {
+			for {
+				stream, err := frpConn.AcceptStream(context.Background())
+				if err != nil {
+					log.Debug("Accept new quic mux stream error: %v", err)
+					_ = frpConn.CloseWithError(0, "")
+					return
+				}
+				go svr.handleConnection(ctx, utilnet.QuicStreamToNetConn(stream, frpConn))
+			}
+		}(context.Background(), c)
+	}
+}
+
 func (svr *Service) RegisterControl(ctlConn net.Conn, loginMsg *msg.Login) (err error) {
 	// If client's RunID is empty, it's a new client, we just create a new controller.
 	// Otherwise, we check if there is one controller has the same run id. If so, we release previous controller and start new one.
@@ -467,7 +552,7 @@ func (svr *Service) RegisterControl(ctlConn net.Conn, loginMsg *msg.Login) (err 
 		}
 	}
 
-	ctx := frpNet.NewContextFromConn(ctlConn)
+	ctx := utilnet.NewContextFromConn(ctlConn)
 	xl := xlog.FromContextSafe(ctx)
 	xl.AppendPrefix(loginMsg.RunID)
 	ctx = xlog.NewContext(ctx, xl)
@@ -487,7 +572,7 @@ func (svr *Service) RegisterControl(ctlConn net.Conn, loginMsg *msg.Login) (err 
 
 	ctl := NewControl(ctx, svr.rc, svr.pxyManager, svr.pluginManager, svr.authVerifier, ctlConn, loginMsg, svr.cfg)
 	if oldCtl := svr.ctlManager.Add(loginMsg.RunID, ctl); oldCtl != nil {
-		oldCtl.allShutdown.WaitDone()
+		oldCtl.WaitClosed()
 	}
 
 	ctl.Start()
@@ -505,7 +590,7 @@ func (svr *Service) RegisterControl(ctlConn net.Conn, loginMsg *msg.Login) (err 
 
 // RegisterWorkConn register a new work connection to control and proxies need it.
 func (svr *Service) RegisterWorkConn(workConn net.Conn, newMsg *msg.NewWorkConn) error {
-	xl := frpNet.NewLogFromConn(workConn)
+	xl := utilnet.NewLogFromConn(workConn)
 	ctl, exist := svr.ctlManager.GetByID(newMsg.RunID)
 	if !exist {
 		xl.Warn("No client control found for run id [%s]", newMsg.RunID)
@@ -537,8 +622,17 @@ func (svr *Service) RegisterWorkConn(workConn net.Conn, newMsg *msg.NewWorkConn)
 }
 
 func (svr *Service) RegisterVisitorConn(visitorConn net.Conn, newMsg *msg.NewVisitorConn) error {
+	visitorUser := ""
+	// TODO: Compatible with old versions, can be without runID, user is empty. In later versions, it will be mandatory to include runID.
+	if newMsg.RunID != "" {
+		ctl, exist := svr.ctlManager.GetByID(newMsg.RunID)
+		if !exist {
+			return fmt.Errorf("no client control found for run id [%s]", newMsg.RunID)
+		}
+		visitorUser = ctl.loginMsg.User
+	}
 	return svr.rc.VisitorManager.NewConn(newMsg.ProxyName, visitorConn, newMsg.Timestamp, newMsg.SignKey,
-		newMsg.UseEncryption, newMsg.UseCompression)
+		newMsg.UseEncryption, newMsg.UseCompression, visitorUser)
 }
 
 type fushionConn struct {

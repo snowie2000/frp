@@ -17,6 +17,7 @@ package proxy
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 
 	"github.com/fatedier/frp/pkg/config"
@@ -25,17 +26,36 @@ import (
 	"github.com/fatedier/frp/pkg/util/vhost"
 )
 
+func init() {
+	RegisterProxyFactory(reflect.TypeOf(&config.TCPMuxProxyConf{}), NewTCPMuxProxy)
+}
+
 type TCPMuxProxy struct {
 	*BaseProxy
 	cfg *config.TCPMuxProxyConf
 }
 
-func (pxy *TCPMuxProxy) httpConnectListen(domain, routeByHTTPUser string, addrs []string) ([]string, error) {
+func NewTCPMuxProxy(baseProxy *BaseProxy, cfg config.ProxyConf) Proxy {
+	unwrapped, ok := cfg.(*config.TCPMuxProxyConf)
+	if !ok {
+		return nil
+	}
+	return &TCPMuxProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
+}
+
+func (pxy *TCPMuxProxy) httpConnectListen(
+	domain, routeByHTTPUser, httpUser, httpPwd string, addrs []string) ([]string, error,
+) {
 	var l net.Listener
 	var err error
 	routeConfig := &vhost.RouteConfig{
 		Domain:          domain,
 		RouteByHTTPUser: routeByHTTPUser,
+		Username:        httpUser,
+		Password:        httpPwd,
 	}
 	if pxy.cfg.Group != "" {
 		l, err = pxy.rc.TCPMuxGroupCtl.Listen(pxy.ctx, pxy.cfg.Multiplexer, pxy.cfg.Group, pxy.cfg.GroupKey, *routeConfig)
@@ -58,20 +78,21 @@ func (pxy *TCPMuxProxy) httpConnectRun() (remoteAddr string, err error) {
 			continue
 		}
 
-		addrs, err = pxy.httpConnectListen(domain, pxy.cfg.RouteByHTTPUser, addrs)
+		addrs, err = pxy.httpConnectListen(domain, pxy.cfg.RouteByHTTPUser, pxy.cfg.HTTPUser, pxy.cfg.HTTPPwd, addrs)
 		if err != nil {
 			return "", err
 		}
 	}
 
 	if pxy.cfg.SubDomain != "" {
-		addrs, err = pxy.httpConnectListen(pxy.cfg.SubDomain+"."+pxy.serverCfg.SubDomainHost, pxy.cfg.RouteByHTTPUser, addrs)
+		addrs, err = pxy.httpConnectListen(pxy.cfg.SubDomain+"."+pxy.serverCfg.SubDomainHost,
+			pxy.cfg.RouteByHTTPUser, pxy.cfg.HTTPUser, pxy.cfg.HTTPPwd, addrs)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	pxy.startListenHandler(pxy, HandleUserTCPConnection)
+	pxy.startCommonTCPListenersHandler()
 	remoteAddr = strings.Join(addrs, ",")
 	return remoteAddr, err
 }
