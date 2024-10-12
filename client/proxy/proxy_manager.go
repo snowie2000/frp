@@ -21,28 +21,31 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/samber/lo"
+
 	"github.com/fatedier/frp/client/event"
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
 
 type Manager struct {
-	proxies        map[string]*Wrapper
-	msgTransporter transport.MessageTransporter
+	proxies            map[string]*Wrapper
+	msgTransporter     transport.MessageTransporter
+	inWorkConnCallback func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
 
 	closed bool
 	mu     sync.RWMutex
 
-	clientCfg config.ClientCommonConf
+	clientCfg *v1.ClientCommonConfig
 
 	ctx context.Context
 }
 
 func NewManager(
 	ctx context.Context,
-	clientCfg config.ClientCommonConf,
+	clientCfg *v1.ClientCommonConfig,
 	msgTransporter transport.MessageTransporter,
 ) *Manager {
 	return &Manager{
@@ -67,6 +70,10 @@ func (pm *Manager) StartProxy(name string, remoteAddr string, serverRespErr stri
 		return err
 	}
 	return nil
+}
+
+func (pm *Manager) SetInWorkConnCallback(cb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool) {
+	pm.inWorkConnCallback = cb
 }
 
 func (pm *Manager) Close() {
@@ -113,15 +120,27 @@ func (pm *Manager) GetAllProxyStatus() []*WorkingStatus {
 	return ps
 }
 
-func (pm *Manager) Reload(pxyCfgs map[string]config.ProxyConf) {
+func (pm *Manager) GetProxyStatus(name string) (*WorkingStatus, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pxy, ok := pm.proxies[name]; ok {
+		return pxy.GetStatus(), true
+	}
+	return nil, false
+}
+
+func (pm *Manager) UpdateAll(proxyCfgs []v1.ProxyConfigurer) {
 	xl := xlog.FromContextSafe(pm.ctx)
+	proxyCfgsMap := lo.KeyBy(proxyCfgs, func(c v1.ProxyConfigurer) string {
+		return c.GetBaseConfig().Name
+	})
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	delPxyNames := make([]string, 0)
 	for name, pxy := range pm.proxies {
 		del := false
-		cfg, ok := pxyCfgs[name]
+		cfg, ok := proxyCfgsMap[name]
 		if !ok || !reflect.DeepEqual(pxy.Cfg, cfg) {
 			del = true
 		}
@@ -133,13 +152,17 @@ func (pm *Manager) Reload(pxyCfgs map[string]config.ProxyConf) {
 		}
 	}
 	if len(delPxyNames) > 0 {
-		xl.Info("proxy removed: %s", delPxyNames)
+		xl.Infof("proxy removed: %s", delPxyNames)
 	}
 
 	addPxyNames := make([]string, 0)
-	for name, cfg := range pxyCfgs {
+	for _, cfg := range proxyCfgs {
+		name := cfg.GetBaseConfig().Name
 		if _, ok := pm.proxies[name]; !ok {
 			pxy := NewWrapper(pm.ctx, cfg, pm.clientCfg, pm.HandleEvent, pm.msgTransporter)
+			if pm.inWorkConnCallback != nil {
+				pxy.SetInWorkConnCallback(pm.inWorkConnCallback)
+			}
 			pm.proxies[name] = pxy
 			addPxyNames = append(addPxyNames, name)
 
@@ -147,6 +170,6 @@ func (pm *Manager) Reload(pxyCfgs map[string]config.ProxyConf) {
 		}
 	}
 	if len(addPxyNames) > 0 {
-		xl.Info("proxy added: %s", addPxyNames)
+		xl.Infof("proxy added: %s", addPxyNames)
 	}
 }

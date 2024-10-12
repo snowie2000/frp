@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fatedier/golib/crypto"
 	quic "github.com/quic-go/quic-go"
 
 	"github.com/fatedier/frp/pkg/util/xlog"
@@ -75,9 +76,11 @@ type WrapReadWriteCloserConn struct {
 	io.ReadWriteCloser
 
 	underConn net.Conn
+
+	remoteAddr net.Addr
 }
 
-func WrapReadWriteCloserToConn(rwc io.ReadWriteCloser, underConn net.Conn) net.Conn {
+func WrapReadWriteCloserToConn(rwc io.ReadWriteCloser, underConn net.Conn) *WrapReadWriteCloserConn {
 	return &WrapReadWriteCloserConn{
 		ReadWriteCloser: rwc,
 		underConn:       underConn,
@@ -91,7 +94,14 @@ func (conn *WrapReadWriteCloserConn) LocalAddr() net.Addr {
 	return (*net.TCPAddr)(nil)
 }
 
+func (conn *WrapReadWriteCloserConn) SetRemoteAddr(addr net.Addr) {
+	conn.remoteAddr = addr
+}
+
 func (conn *WrapReadWriteCloserConn) RemoteAddr() net.Addr {
+	if conn.remoteAddr != nil {
+		return conn.remoteAddr
+	}
 	if conn.underConn != nil {
 		return conn.underConn.RemoteAddr()
 	}
@@ -215,4 +225,19 @@ func (conn *wrapQuicStream) RemoteAddr() net.Addr {
 func (conn *wrapQuicStream) Close() error {
 	conn.Stream.CancelRead(0)
 	return conn.Stream.Close()
+}
+
+func NewCryptoReadWriter(rw io.ReadWriter, key []byte) (io.ReadWriter, error) {
+	encReader := crypto.NewReader(rw, key)
+	encWriter, err := crypto.NewWriter(rw, key)
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Writer
+	}{
+		Reader: encReader,
+		Writer: encWriter,
+	}, nil
 }

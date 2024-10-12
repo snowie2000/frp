@@ -122,7 +122,7 @@ func (k *keeper) keepalive(c *aliveConn) {
 		// 该连接异常断开，从pool中删除连接并申请一个新连接
 		k.lock.Lock()
 		defer k.lock.Unlock()
-		k.logger.Info("[keepalive] error: %v", e)
+		k.logger.Infof("[keepalive] error: %v", e)
 		c.Close()
 		for it := k.connList.Front(); it.Next() != nil; it = it.Next() {
 			if it.Value == c {
@@ -176,7 +176,7 @@ func (k *keeper) connFactory() {
 					select {
 					case <-t.C:
 						{
-							k.logger.Warn("timeout getting a working connection")
+							k.logger.Warnf("timeout getting a working connection")
 							k.connResp <- nil // 等待超时，放弃获取连接，返回一个nil
 							return
 						}
@@ -208,8 +208,8 @@ func (k *keeper) GetConn() (c net.Conn, success bool) {
 
 func (k *keeper) Stop() {
 	k.lock.Lock()
-	defer k.logger.Info("ConnKeeper stopped")
-	k.logger.Info("ConnKeeper stopping")
+	defer k.logger.Infof("ConnKeeper stopped")
+	k.logger.Infof("ConnKeeper stopping")
 	k.bClosed = true
 	close(k.connReq) // stop connFactory
 	k.lock.Unlock()
@@ -221,5 +221,5 @@ func (k *keeper) Stop() {
 		}
 		c.Close()
 	}
-	k.logger.Info("ok")
+	k.logger.Infof("ok")
 }

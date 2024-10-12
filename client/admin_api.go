@@ -15,27 +15,51 @@
 package client
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
-	"strings"
 	"time"
-
-	"github.com/samber/lo"
 
 	"github.com/fatedier/frp/client/proxy"
 	"github.com/fatedier/frp/pkg/config"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
+	httppkg "github.com/fatedier/frp/pkg/util/http"
 	"github.com/fatedier/frp/pkg/util/log"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
 type GeneralResponse struct {
 	Code int
 	Msg  string
+}
+
+func (svr *Service) registerRouteHandlers(helper *httppkg.RouterRegisterHelper) {
+	helper.Router.HandleFunc("/healthz", svr.healthz)
+	subRouter := helper.Router.NewRoute().Subrouter()
+
+	subRouter.Use(helper.AuthMiddleware.Middleware)
+
+	// api, see admin_api.go
+	subRouter.HandleFunc("/api/reload", svr.apiReload).Methods("GET")
+	subRouter.HandleFunc("/api/stop", svr.apiStop).Methods("POST")
+	subRouter.HandleFunc("/api/status", svr.apiStatus).Methods("GET")
+	subRouter.HandleFunc("/api/config", svr.apiGetConfig).Methods("GET")
+	subRouter.HandleFunc("/api/config", svr.apiPutConfig).Methods("PUT")
+
+	// view
+	subRouter.Handle("/favicon.ico", http.FileServer(helper.AssetsFS)).Methods("GET")
+	subRouter.PathPrefix("/static/").Handler(
+		netpkg.MakeHTTPGzipHandler(http.StripPrefix("/static/", http.FileServer(helper.AssetsFS))),
+	).Methods("GET")
+	subRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/", http.StatusMovedPermanently)
+	})
 }
 
 // /healthz
@@ -44,42 +68,53 @@ func (svr *Service) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // GET /api/reload
-func (svr *Service) apiReload(w http.ResponseWriter, _ *http.Request) {
+func (svr *Service) apiReload(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
+	strictConfigMode := false
+	strictStr := r.URL.Query().Get("strictConfig")
+	if strictStr != "" {
+		strictConfigMode, _ = strconv.ParseBool(strictStr)
+	}
 
-	log.Info("api request [/api/reload]")
+	log.Infof("api request [/api/reload]")
 	defer func() {
-		log.Info("api response [/api/reload], code [%d]", res.Code)
+		log.Infof("api response [/api/reload], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
 			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
 
-	_, pxyCfgs, visitorCfgs, err := config.ParseClientConfig(svr.cfgFile)
+	cliCfg, proxyCfgs, visitorCfgs, _, err := config.LoadClientConfig(svr.configFilePath, strictConfigMode)
 	if err != nil {
 		res.Code = 400
 		res.Msg = err.Error()
-		log.Warn("reload frpc proxy config error: %s", res.Msg)
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
+		return
+	}
+	if _, err := validation.ValidateAllClientConfig(cliCfg, proxyCfgs, visitorCfgs); err != nil {
+		res.Code = 400
+		res.Msg = err.Error()
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
 		return
 	}
 
-	if err = svr.ReloadConf(pxyCfgs, visitorCfgs); err != nil {
+	if err := svr.UpdateAllConfigurer(proxyCfgs, visitorCfgs); err != nil {
 		res.Code = 500
 		res.Msg = err.Error()
-		log.Warn("reload frpc proxy config error: %s", res.Msg)
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
 		return
 	}
-	log.Info("success reload conf")
+	log.Infof("success reload conf")
 }
 
 // POST /api/stop
 func (svr *Service) apiStop(w http.ResponseWriter, _ *http.Request) {
 	res := GeneralResponse{Code: 200}
 
-	log.Info("api request [/api/stop]")
+	log.Infof("api request [/api/stop]")
 	defer func() {
-		log.Info("api response [/api/stop], code [%d]", res.Code)
+		log.Infof("api response [/api/stop], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
 			_, _ = w.Write([]byte(res.Msg))
@@ -112,11 +147,11 @@ func NewProxyStatusResp(status *proxy.WorkingStatus, serverAddr string) ProxySta
 	if baseCfg.LocalPort != 0 {
 		psr.LocalAddr = net.JoinHostPort(baseCfg.LocalIP, strconv.Itoa(baseCfg.LocalPort))
 	}
-	psr.Plugin = baseCfg.Plugin
+	psr.Plugin = baseCfg.Plugin.Type
 
 	if status.Err == "" {
 		psr.RemoteAddr = status.RemoteAddr
-		if lo.Contains([]string{"tcp", "udp"}, status.Type) {
+		if slices.Contains([]string{"tcp", "udp"}, status.Type) {
 			psr.RemoteAddr = serverAddr + psr.RemoteAddr
 		}
 	}
@@ -130,24 +165,31 @@ func (svr *Service) apiStatus(w http.ResponseWriter, _ *http.Request) {
 		res StatusResp = make(map[string][]ProxyStatusResp)
 	)
 
-	log.Info("Http request [/api/status]")
+	log.Infof("Http request [/api/status]")
 	defer func() {
-		log.Info("Http response [/api/status]")
+		log.Infof("Http response [/api/status]")
 		buf, _ = json.Marshal(&res)
 		_, _ = w.Write(buf)
 	}()
 
-	ps := svr.ctl.pm.GetAllProxyStatus()
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl == nil {
+		return
+	}
+
+	ps := ctl.pm.GetAllProxyStatus()
 	for _, status := range ps {
-		res[status.Type] = append(res[status.Type], NewProxyStatusResp(status, svr.cfg.ServerAddr))
+		res[status.Type] = append(res[status.Type], NewProxyStatusResp(status, svr.common.ServerAddr))
 	}
 
 	for _, arrs := range res {
 		if len(arrs) <= 1 {
 			continue
 		}
-		sort.Slice(arrs, func(i, j int) bool {
-			return strings.Compare(arrs[i].Name, arrs[j].Name) < 0
+		slices.SortFunc(arrs, func(a, b ProxyStatusResp) int {
+			return cmp.Compare(a.Name, b.Name)
 		})
 	}
 }
@@ -156,49 +198,39 @@ func (svr *Service) apiStatus(w http.ResponseWriter, _ *http.Request) {
 func (svr *Service) apiGetConfig(w http.ResponseWriter, _ *http.Request) {
 	res := GeneralResponse{Code: 200}
 
-	log.Info("Http get request [/api/config]")
+	log.Infof("Http get request [/api/config]")
 	defer func() {
-		log.Info("Http get response [/api/config], code [%d]", res.Code)
+		log.Infof("Http get response [/api/config], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
 			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
 
-	if svr.cfgFile == "" {
+	if svr.configFilePath == "" {
 		res.Code = 400
 		res.Msg = "frpc has no config file path"
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 
-	content, err := config.GetRenderedConfFromFile(svr.cfgFile)
+	content, err := os.ReadFile(svr.configFilePath)
 	if err != nil {
 		res.Code = 400
 		res.Msg = err.Error()
-		log.Warn("load frpc config file error: %s", res.Msg)
+		log.Warnf("load frpc config file error: %s", res.Msg)
 		return
 	}
-
-	rows := strings.Split(string(content), "\n")
-	newRows := make([]string, 0, len(rows))
-	for _, row := range rows {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			continue
-		}
-		newRows = append(newRows, row)
-	}
-	res.Msg = strings.Join(newRows, "\n")
+	res.Msg = string(content)
 }
 
 // PUT /api/config
 func (svr *Service) apiPutConfig(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 
-	log.Info("Http put request [/api/config]")
+	log.Infof("Http put request [/api/config]")
 	defer func() {
-		log.Info("Http put response [/api/config], code [%d]", res.Code)
+		log.Infof("Http put response [/api/config], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
 			_, _ = w.Write([]byte(res.Msg))
@@ -210,63 +242,21 @@ func (svr *Service) apiPutConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		res.Code = 400
 		res.Msg = fmt.Sprintf("read request body error: %v", err)
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 
 	if len(body) == 0 {
 		res.Code = 400
 		res.Msg = "body can't be empty"
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 
-	// get token from origin content
-	token := ""
-	b, err := os.ReadFile(svr.cfgFile)
-	if err != nil {
-		res.Code = 400
-		res.Msg = err.Error()
-		log.Warn("load frpc config file error: %s", res.Msg)
-		return
-	}
-	content := string(b)
-
-	for _, row := range strings.Split(content, "\n") {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			token = row
-			break
-		}
-	}
-
-	tmpRows := make([]string, 0)
-	for _, row := range strings.Split(string(body), "\n") {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			continue
-		}
-		tmpRows = append(tmpRows, row)
-	}
-
-	newRows := make([]string, 0)
-	if token != "" {
-		for _, row := range tmpRows {
-			newRows = append(newRows, row)
-			if strings.HasPrefix(row, "[common]") {
-				newRows = append(newRows, token)
-			}
-		}
-	} else {
-		newRows = tmpRows
-	}
-	content = strings.Join(newRows, "\n")
-
-	err = os.WriteFile(svr.cfgFile, []byte(content), 0o644)
-	if err != nil {
+	if err := os.WriteFile(svr.configFilePath, body, 0o600); err != nil {
 		res.Code = 500
 		res.Msg = fmt.Sprintf("write content to frpc config file error: %v", err)
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 }

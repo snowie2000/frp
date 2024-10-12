@@ -6,7 +6,7 @@ ROOT=$(unset CDPATH && cd "$(dirname "$SCRIPT")/.." && pwd)
 ginkgo_command=$(which ginkgo 2>/dev/null)
 if [ -z "$ginkgo_command" ]; then
     echo "ginkgo not found, try to install..."
-    go install github.com/onsi/ginkgo/v2/ginkgo@v2.8.3
+    go install github.com/onsi/ginkgo/v2/ginkgo@v2.17.1
 fi
 
 debug=false
@@ -26,5 +26,9 @@ frpsPath=${ROOT}/bin/frps
 if [ "${FRPS_PATH}" ]; then
     frpsPath="${FRPS_PATH}"
 fi
+concurrency="16"
+if [ "${CONCURRENCY}" ]; then
+    concurrency="${CONCURRENCY}"
+fi
 
-ginkgo -nodes=8 --poll-progress-after=60s ${ROOT}/test/e2e -- -frpc-path=${frpcPath} -frps-path=${frpsPath} -log-level=${logLevel} -debug=${debug}
+ginkgo -nodes=${concurrency} --poll-progress-after=60s ${ROOT}/test/e2e -- -frpc-path=${frpcPath} -frps-path=${frpsPath} -log-level=${logLevel} -debug=${debug}

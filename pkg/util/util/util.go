@@ -20,7 +20,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -45,16 +45,6 @@ func RandIDWithLen(idLen int) (id string, err error) {
 
 	id = fmt.Sprintf("%x", b)
 	return id[:idLen], nil
-}
-
-// RandIDWithRandLen return a rand string with length between [start, end).
-func RandIDWithRandLen(start, end int) (id string, err error) {
-	if start >= end {
-		err = fmt.Errorf("start should be less than end")
-		return
-	}
-	idLen := mathrand.Intn(end-start) + start
-	return RandIDWithLen(idLen)
 }
 
 func GetAuthKey(token string, timestamp int64) (key string) {
@@ -134,7 +124,7 @@ func RandomSleep(duration time.Duration, minRatio, maxRatio float64) time.Durati
 	if max <= min {
 		n = min
 	} else {
-		n = mathrand.Int63n(max-min) + min
+		n = mathrand.Int64N(max-min) + min
 	}
 	d := duration * time.Duration(n) / time.Duration(1000)
 	time.Sleep(d)

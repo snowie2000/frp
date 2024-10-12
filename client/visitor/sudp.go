@@ -25,10 +25,10 @@ import (
 	"github.com/fatedier/golib/errors"
 	libio "github.com/fatedier/golib/io"
 
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/proto/udp"
-	utilnet "github.com/fatedier/frp/pkg/util/net"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
@@ -42,7 +42,7 @@ type SUDPVisitor struct {
 	readCh  chan *msg.UDPPacket
 	sendCh  chan *msg.UDPPacket
 
-	cfg *config.SUDPVisitorConf
+	cfg *v1.SUDPVisitorConfig
 }
 
 // SUDP Run start listen a udp port
@@ -62,7 +62,7 @@ func (sv *SUDPVisitor) Run() (err error) {
 	sv.sendCh = make(chan *msg.UDPPacket, 1024)
 	sv.readCh = make(chan *msg.UDPPacket, 1024)
 
-	xl.Info("sudp start to work, listen on %s", addr)
+	xl.Infof("sudp start to work, listen on %s", addr)
 
 	go sv.dispatcher()
 	go udp.ForwardUserConn(sv.udpConn, sv.readCh, sv.sendCh, int(sv.clientCfg.UDPPacketSize))
@@ -84,17 +84,17 @@ func (sv *SUDPVisitor) dispatcher() {
 		select {
 		case firstPacket = <-sv.sendCh:
 			if firstPacket == nil {
-				xl.Info("frpc sudp visitor proxy is closed")
+				xl.Infof("frpc sudp visitor proxy is closed")
 				return
 			}
 		case <-sv.checkCloseCh:
-			xl.Info("frpc sudp visitor proxy is closed")
+			xl.Infof("frpc sudp visitor proxy is closed")
 			return
 		}
 
 		visitorConn, err = sv.getNewVisitorConn()
 		if err != nil {
-			xl.Warn("newVisitorConn to frps error: %v, try to reconnect", err)
+			xl.Warnf("newVisitorConn to frps error: %v, try to reconnect", err)
 			continue
 		}
 
@@ -111,7 +111,7 @@ func (sv *SUDPVisitor) dispatcher() {
 
 func (sv *SUDPVisitor) worker(workConn net.Conn, firstPacket *msg.UDPPacket) {
 	xl := xlog.FromContextSafe(sv.ctx)
-	xl.Debug("starting sudp proxy worker")
+	xl.Debugf("starting sudp proxy worker")
 
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
@@ -134,21 +134,21 @@ func (sv *SUDPVisitor) worker(workConn net.Conn, firstPacket *msg.UDPPacket) {
 			// frpc will send heartbeat in workConn to frpc visitor for keeping alive
 			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			if rawMsg, errRet = msg.ReadMsg(conn); errRet != nil {
-				xl.Warn("read from workconn for user udp conn error: %v", errRet)
+				xl.Warnf("read from workconn for user udp conn error: %v", errRet)
 				return
 			}
 
 			_ = conn.SetReadDeadline(time.Time{})
 			switch m := rawMsg.(type) {
 			case *msg.Ping:
-				xl.Debug("frpc visitor get ping message from frpc")
+				xl.Debugf("frpc visitor get ping message from frpc")
 				continue
 			case *msg.UDPPacket:
 				if errRet := errors.PanicToError(func() {
 					sv.readCh <- m
-					xl.Trace("frpc visitor get udp packet from workConn: %s", m.Content)
+					xl.Tracef("frpc visitor get udp packet from workConn: %s", m.Content)
 				}); errRet != nil {
-					xl.Info("reader goroutine for udp work connection closed")
+					xl.Infof("reader goroutine for udp work connection closed")
 					return
 				}
 			}
@@ -165,25 +165,25 @@ func (sv *SUDPVisitor) worker(workConn net.Conn, firstPacket *msg.UDPPacket) {
 		var errRet error
 		if firstPacket != nil {
 			if errRet = msg.WriteMsg(conn, firstPacket); errRet != nil {
-				xl.Warn("sender goroutine for udp work connection closed: %v", errRet)
+				xl.Warnf("sender goroutine for udp work connection closed: %v", errRet)
 				return
 			}
-			xl.Trace("send udp package to workConn: %s", firstPacket.Content)
+			xl.Tracef("send udp package to workConn: %s", firstPacket.Content)
 		}
 
 		for {
 			select {
 			case udpMsg, ok := <-sv.sendCh:
 				if !ok {
-					xl.Info("sender goroutine for udp work connection closed")
+					xl.Infof("sender goroutine for udp work connection closed")
 					return
 				}
 
 				if errRet = msg.WriteMsg(conn, udpMsg); errRet != nil {
-					xl.Warn("sender goroutine for udp work connection closed: %v", errRet)
+					xl.Warnf("sender goroutine for udp work connection closed: %v", errRet)
 					return
 				}
-				xl.Trace("send udp package to workConn: %s", udpMsg.Content)
+				xl.Tracef("send udp package to workConn: %s", udpMsg.Content)
 			case <-closeCh:
 				return
 			}
@@ -194,7 +194,7 @@ func (sv *SUDPVisitor) worker(workConn net.Conn, firstPacket *msg.UDPPacket) {
 	go workConnSenderFn(workConn)
 
 	wg.Wait()
-	xl.Info("sudp worker is closed")
+	xl.Infof("sudp worker is closed")
 }
 
 func (sv *SUDPVisitor) getNewVisitorConn() (net.Conn, error) {
@@ -208,10 +208,10 @@ func (sv *SUDPVisitor) getNewVisitorConn() (net.Conn, error) {
 	newVisitorConnMsg := &msg.NewVisitorConn{
 		RunID:          sv.helper.RunID(),
 		ProxyName:      sv.cfg.ServerName,
-		SignKey:        util.GetAuthKey(sv.cfg.Sk, now),
+		SignKey:        util.GetAuthKey(sv.cfg.SecretKey, now),
 		Timestamp:      now,
-		UseEncryption:  sv.cfg.UseEncryption,
-		UseCompression: sv.cfg.UseCompression,
+		UseEncryption:  sv.cfg.Transport.UseEncryption,
+		UseCompression: sv.cfg.Transport.UseCompression,
 	}
 	err = msg.WriteMsg(visitorConn, newVisitorConnMsg)
 	if err != nil {
@@ -232,17 +232,17 @@ func (sv *SUDPVisitor) getNewVisitorConn() (net.Conn, error) {
 
 	var remote io.ReadWriteCloser
 	remote = visitorConn
-	if sv.cfg.UseEncryption {
-		remote, err = libio.WithEncryption(remote, []byte(sv.cfg.Sk))
+	if sv.cfg.Transport.UseEncryption {
+		remote, err = libio.WithEncryption(remote, []byte(sv.cfg.SecretKey))
 		if err != nil {
-			xl.Error("create encryption stream error: %v", err)
+			xl.Errorf("create encryption stream error: %v", err)
 			return nil, err
 		}
 	}
-	if sv.cfg.UseCompression {
+	if sv.cfg.Transport.UseCompression {
 		remote = libio.WithCompression(remote)
 	}
-	return utilnet.WrapReadWriteCloserToConn(remote, visitorConn), nil
+	return netpkg.WrapReadWriteCloserToConn(remote, visitorConn), nil
 }
 
 func (sv *SUDPVisitor) Close() {

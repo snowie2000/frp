@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !frps
+
 package proxy
 
 import (
@@ -24,21 +26,21 @@ import (
 	"github.com/fatedier/golib/errors"
 	libio "github.com/fatedier/golib/io"
 
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/proto/udp"
 	"github.com/fatedier/frp/pkg/util/limit"
-	utilnet "github.com/fatedier/frp/pkg/util/net"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
 func init() {
-	RegisterProxyFactory(reflect.TypeOf(&config.UDPProxyConf{}), NewUDPProxy)
+	RegisterProxyFactory(reflect.TypeOf(&v1.UDPProxyConfig{}), NewUDPProxy)
 }
 
 type UDPProxy struct {
 	*BaseProxy
 
-	cfg *config.UDPProxyConf
+	cfg *v1.UDPProxyConfig
 
 	localAddr *net.UDPAddr
 	readCh    chan *msg.UDPPacket
@@ -49,8 +51,8 @@ type UDPProxy struct {
 	closed   bool
 }
 
-func NewUDPProxy(baseProxy *BaseProxy, cfg config.ProxyConf) Proxy {
-	unwrapped, ok := cfg.(*config.UDPProxyConf)
+func NewUDPProxy(baseProxy *BaseProxy, cfg v1.ProxyConfigurer) Proxy {
+	unwrapped, ok := cfg.(*v1.UDPProxyConfig)
 	if !ok {
 		return nil
 	}
@@ -88,8 +90,8 @@ func (pxy *UDPProxy) Close() {
 
 func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 	xl := pxy.xl
-	xl.Info("incoming a new work connection for udp proxy, %s", conn.RemoteAddr().String())
-	// close resources releated with old workConn
+	xl.Infof("incoming a new work connection for udp proxy, %s", conn.RemoteAddr().String())
+	// close resources related with old workConn
 	pxy.Close()
 
 	var rwc io.ReadWriteCloser = conn
@@ -99,18 +101,18 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 			return conn.Close()
 		})
 	}
-	if pxy.cfg.UseEncryption {
-		rwc, err = libio.WithEncryption(rwc, []byte(pxy.clientCfg.Token))
+	if pxy.cfg.Transport.UseEncryption {
+		rwc, err = libio.WithEncryption(rwc, []byte(pxy.clientCfg.Auth.Token))
 		if err != nil {
 			conn.Close()
-			xl.Error("create encryption stream error: %v", err)
+			xl.Errorf("create encryption stream error: %v", err)
 			return
 		}
 	}
-	if pxy.cfg.UseCompression {
+	if pxy.cfg.Transport.UseCompression {
 		rwc = libio.WithCompression(rwc)
 	}
-	conn = utilnet.WrapReadWriteCloserToConn(rwc, conn)
+	conn = netpkg.WrapReadWriteCloserToConn(rwc, conn)
 
 	pxy.mu.Lock()
 	pxy.workConn = conn
@@ -123,32 +125,32 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 		for {
 			var udpMsg msg.UDPPacket
 			if errRet := msg.ReadMsgInto(conn, &udpMsg); errRet != nil {
-				xl.Warn("read from workConn for udp error: %v", errRet)
+				xl.Warnf("read from workConn for udp error: %v", errRet)
 				return
 			}
 			if errRet := errors.PanicToError(func() {
-				xl.Trace("get udp package from workConn: %s", udpMsg.Content)
+				xl.Tracef("get udp package from workConn: %s", udpMsg.Content)
 				readCh <- &udpMsg
 			}); errRet != nil {
-				xl.Info("reader goroutine for udp work connection closed: %v", errRet)
+				xl.Infof("reader goroutine for udp work connection closed: %v", errRet)
 				return
 			}
 		}
 	}
 	workConnSenderFn := func(conn net.Conn, sendCh chan msg.Message) {
 		defer func() {
-			xl.Info("writer goroutine for udp work connection closed")
+			xl.Infof("writer goroutine for udp work connection closed")
 		}()
 		var errRet error
 		for rawMsg := range sendCh {
 			switch m := rawMsg.(type) {
 			case *msg.UDPPacket:
-				xl.Trace("send udp package to workConn: %s", m.Content)
+				xl.Tracef("send udp package to workConn: %s", m.Content)
 			case *msg.Ping:
-				xl.Trace("send ping message to udp workConn")
+				xl.Tracef("send ping message to udp workConn")
 			}
 			if errRet = msg.WriteMsg(conn, rawMsg); errRet != nil {
-				xl.Error("udp work write error: %v", errRet)
+				xl.Errorf("udp work write error: %v", errRet)
 				return
 			}
 		}
@@ -160,7 +162,7 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 			if errRet = errors.PanicToError(func() {
 				sendCh <- &msg.Ping{}
 			}); errRet != nil {
-				xl.Trace("heartbeat goroutine for udp work connection closed")
+				xl.Tracef("heartbeat goroutine for udp work connection closed")
 				break
 			}
 		}

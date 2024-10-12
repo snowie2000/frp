@@ -17,24 +17,25 @@ package server
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/fatedier/golib/control/shutdown"
-	"github.com/fatedier/golib/crypto"
-	"github.com/fatedier/golib/errors"
+	"github.com/samber/lo"
 
 	"github.com/fatedier/frp/pkg/auth"
 	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	pkgerr "github.com/fatedier/frp/pkg/errors"
 	"github.com/fatedier/frp/pkg/msg"
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
 	"github.com/fatedier/frp/pkg/transport"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/version"
+	"github.com/fatedier/frp/pkg/util/wait"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
 	"github.com/fatedier/frp/server/metrics"
@@ -110,18 +111,16 @@ type Control struct {
 	msgTransporter transport.MessageTransporter
 
 	// login message
-	loginMsg *msg.Login
 
+	msgDispatcher *msg.Dispatcher
 	// control connection
-	conn net.Conn
 
+	loginMsg *msg.Login
 	// put a message in this channel to send it over control connection to client
-	sendCh chan (msg.Message)
 
+	conn net.Conn
 	// read from this channel to get the next message sent by client
-	readCh chan (msg.Message)
 
-	// work connections
 	workConnMgr *keeper
 
 	// proxies in one client
@@ -134,29 +133,24 @@ type Control struct {
 	portsUsedNum int
 
 	// last time got the Ping message
-	lastPing time.Time
+	lastPing atomic.Value
 
 	// A new run id will be generated when a new client login.
 	// If run id got from login message has same run id, it means it's the same client, so we can
 	// replace old controller instantly.
 	runID string
 
-	readerShutdown  *shutdown.Shutdown
-	writerShutdown  *shutdown.Shutdown
-	managerShutdown *shutdown.Shutdown
-	allShutdown     *shutdown.Shutdown
-
-	started bool
-
 	mu sync.RWMutex
 
 	// Server configuration information
-	serverCfg config.ServerCommonConf
+	serverCfg *v1.ServerConfig
 
-	xl  *xlog.Logger
-	ctx context.Context
+	xl     *xlog.Logger
+	ctx    context.Context
+	doneCh chan struct{}
 }
 
+// TODO(fatedier): Referencing the implementation of frpc, encapsulate the input parameters as SessionContext.
 func NewControl(
 	ctx context.Context,
 	rc *controller.ResourceController,
@@ -164,38 +158,45 @@ func NewControl(
 	pluginManager *plugin.Manager,
 	authVerifier auth.Verifier,
 	ctlConn net.Conn,
+	ctlConnEncrypted bool,
 	loginMsg *msg.Login,
-	serverCfg config.ServerCommonConf,
-) *Control {
+	serverCfg *v1.ServerConfig,
+) (*Control, error) {
 	poolCount := loginMsg.PoolCount
-	if poolCount > int(serverCfg.MaxPoolCount) {
-		poolCount = int(serverCfg.MaxPoolCount)
+	if poolCount > int(serverCfg.Transport.MaxPoolCount) {
+		poolCount = int(serverCfg.Transport.MaxPoolCount)
 	}
 	ctl := &Control{
-		rc:              rc,
-		pxyManager:      pxyManager,
-		pluginManager:   pluginManager,
-		authVerifier:    authVerifier,
-		conn:            ctlConn,
-		loginMsg:        loginMsg,
-		sendCh:          make(chan msg.Message, 10),
-		readCh:          make(chan msg.Message, 10),
-		proxies:         make(map[string]proxy.Proxy),
-		poolCount:       poolCount,
-		portsUsedNum:    0,
-		lastPing:        time.Now(),
-		runID:           loginMsg.RunID,
-		readerShutdown:  shutdown.New(),
-		writerShutdown:  shutdown.New(),
-		managerShutdown: shutdown.New(),
-		allShutdown:     shutdown.New(),
-		serverCfg:       serverCfg,
-		xl:              xlog.FromContextSafe(ctx),
-		ctx:             ctx,
+		rc:            rc,
+		pxyManager:    pxyManager,
+		pluginManager: pluginManager,
+		authVerifier:  authVerifier,
+		conn:          ctlConn,
+		loginMsg:      loginMsg,
+		proxies:       make(map[string]proxy.Proxy),
+		poolCount:     poolCount,
+		portsUsedNum:  0,
+		runID:         loginMsg.RunID,
+		serverCfg:     serverCfg,
+		xl:            xlog.FromContextSafe(ctx),
+		ctx:           ctx,
+		doneCh:        make(chan struct{}),
 	}
-	ctl.workConnMgr = NewKeeper(poolCount, ctl.sendCh, ctl.serverCfg.UserConnTimeout, ctl.xl)
-	ctl.msgTransporter = transport.NewMessageTransporter(ctl.sendCh)
-	return ctl
+	ctl.lastPing.Store(time.Now())
+
+	if ctlConnEncrypted {
+		cryptoRW, err := netpkg.NewCryptoReadWriter(ctl.conn, []byte(ctl.serverCfg.Auth.Token))
+		if err != nil {
+			return nil, err
+		}
+		ctl.msgDispatcher = msg.NewDispatcher(cryptoRW)
+	} else {
+		ctl.msgDispatcher = msg.NewDispatcher(ctl.conn)
+	}
+	ctl.registerMsgHandlers()
+	ctl.workConnMgr = NewKeeper(poolCount, ctl.msgDispatcher.SendChannel(), ctl.serverCfg.UserConnTimeout, ctl.xl)
+	ctl.msgTransporter = transport.NewMessageTransporter(ctl.msgDispatcher.SendChannel())
+	return ctl, nil
 }
 
 // Start send a login success message to client and start working.
@@ -206,50 +207,41 @@ func (ctl *Control) Start() {
 		Error:   "",
 	}
 	_ = msg.WriteMsg(ctl.conn, loginRespMsg)
-	ctl.mu.Lock()
-	ctl.started = true
-	ctl.mu.Unlock()
 
-	go ctl.writer()
 	go func() {
 		for i := 0; i < ctl.poolCount; i++ {
 			// ignore error here, that means that this control is closed
-			_ = errors.PanicToError(func() {
-				ctl.sendCh <- &msg.ReqWorkConn{}
-			})
+			_ = ctl.msgDispatcher.Send(&msg.ReqWorkConn{})
 		}
 	}()
-
-	go ctl.manager()
-	go ctl.reader()
-	go ctl.stoper()
+	go ctl.worker()
 }
 
 func (ctl *Control) Close() error {
-	ctl.allShutdown.Start()
+	ctl.conn.Close()
 	return nil
 }
 
 func (ctl *Control) Replaced(newCtl *Control) {
 	xl := ctl.xl
-	xl.Info("Replaced by client [%s]", newCtl.runID)
+	xl.Infof("Replaced by client [%s]", newCtl.runID)
 	ctl.runID = ""
-	ctl.allShutdown.Start()
+	ctl.conn.Close()
 }
 
 func (ctl *Control) RegisterWorkConn(conn net.Conn) error {
 	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
+			xl.Errorf("panic error: %v", err)
+			xl.Errorf(string(debug.Stack()))
 		}
 	}()
 	if ctl.workConnMgr.AddConn(conn) == nil {
-		xl.Debug("new work connection registered")
+		xl.Debugf("new work connection registered")
 		return nil
 	} else {
-		xl.Debug("work connection pool is full, discarding")
+		xl.Debugf("work connection pool is full, discarding")
 		return fmt.Errorf("work connection pool is full, discarding")
 	}
 }
@@ -262,8 +254,8 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
+			xl.Errorf("panic error: %v", err)
+			xl.Errorf(string(debug.Stack()))
 		}
 	}()
 
@@ -272,92 +264,43 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 	workConn, ok = ctl.workConnMgr.GetConn()
 	if !ok {
 		err = pkgerr.ErrCtlClosed
+		xl.Warnf("no work connections available, %v", err)
 		return
 	}
-	xl.Debug("get work connection from pool")
+	xl.Debugf("get work connection from pool")
+
+	// When we get a work connection from pool, replace it with a new one.
+	_ = ctl.msgDispatcher.Send(&msg.ReqWorkConn{})
 	return
 }
 
-func (ctl *Control) writer() {
-	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
-		}
-	}()
-
-	defer ctl.allShutdown.Start()
-	defer ctl.writerShutdown.Done()
-
-	encWriter, err := crypto.NewWriter(ctl.conn, []byte(ctl.serverCfg.Token))
-	if err != nil {
-		xl.Error("crypto new writer error: %v", err)
-		ctl.allShutdown.Start()
+func (ctl *Control) heartbeatWorker() {
+	if ctl.serverCfg.Transport.HeartbeatTimeout <= 0 {
 		return
 	}
-	for {
-		m, ok := <-ctl.sendCh
-		if !ok {
-			xl.Info("control writer is closing")
-			return
-		}
 
-		if err := msg.WriteMsg(encWriter, m); err != nil {
-			xl.Warn("write message to control connection error: %v", err)
-			return
-		}
-	}
-}
-
-func (ctl *Control) reader() {
 	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
-		}
-	}()
-
-	defer ctl.allShutdown.Start()
-	defer ctl.readerShutdown.Done()
-
-	encReader := crypto.NewReader(ctl.conn, []byte(ctl.serverCfg.Token))
-	for {
-		m, err := msg.ReadMsg(encReader)
-		if err != nil {
-			if err == io.EOF {
-				xl.Debug("control connection closed")
-				return
-			}
-			xl.Warn("read error: %v", err)
+	go wait.Until(func() {
+		if time.Since(ctl.lastPing.Load().(time.Time)) > time.Duration(ctl.serverCfg.Transport.HeartbeatTimeout)*time.Second {
+			xl.Warnf("heartbeat timeout")
 			ctl.conn.Close()
 			return
 		}
-
-		ctl.readCh <- m
-	}
+	}, time.Second, ctl.doneCh)
 }
 
-func (ctl *Control) stoper() {
+func (ctl *Control) WaitClosed() {
+	<-ctl.doneCh
+}
+
+func (ctl *Control) worker() {
 	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
-		}
-	}()
 
-	ctl.allShutdown.WaitStart()
+	go ctl.heartbeatWorker()
+	go ctl.msgDispatcher.Run()
 
+	<-ctl.msgDispatcher.Done()
 	ctl.conn.Close()
-	ctl.readerShutdown.WaitDone()
-
-	close(ctl.readCh)
-	ctl.managerShutdown.WaitDone()
-
-	close(ctl.sendCh)
-	ctl.writerShutdown.WaitDone()
 
 	ctl.mu.Lock()
 	defer ctl.mu.Unlock()
@@ -367,7 +310,7 @@ func (ctl *Control) stoper() {
 	for _, pxy := range ctl.proxies {
 		pxy.Close()
 		ctl.pxyManager.Del(pxy.GetName())
-		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseConfig().ProxyType)
+		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
 
 		notifyContent := &plugin.CloseProxyContent{
 			User: plugin.UserInfo{
@@ -384,140 +327,110 @@ func (ctl *Control) stoper() {
 		}()
 	}
 
-	ctl.allShutdown.Done()
-	xl.Info("client exit success")
 	metrics.Server.CloseClient()
+	xl.Infof("client exit success")
+	close(ctl.doneCh)
 }
 
-// block until Control closed
-func (ctl *Control) WaitClosed() {
-	ctl.mu.RLock()
-	started := ctl.started
-	ctl.mu.RUnlock()
+func (ctl *Control) registerMsgHandlers() {
+	ctl.msgDispatcher.RegisterHandler(&msg.NewProxy{}, ctl.handleNewProxy)
+	ctl.msgDispatcher.RegisterHandler(&msg.Ping{}, ctl.handlePing)
+	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleVisitor{}, msg.AsyncHandler(ctl.handleNatHoleVisitor))
+	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleClient{}, msg.AsyncHandler(ctl.handleNatHoleClient))
+	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleReport{}, msg.AsyncHandler(ctl.handleNatHoleReport))
+	ctl.msgDispatcher.RegisterHandler(&msg.CloseProxy{}, ctl.handleCloseProxy)
+}
 
-	if !started {
-		ctl.allShutdown.Done()
+func (ctl *Control) handleNewProxy(m msg.Message) {
+	xl := ctl.xl
+	inMsg := m.(*msg.NewProxy)
+
+	content := &plugin.NewProxyContent{
+		User: plugin.UserInfo{
+			User:  ctl.loginMsg.User,
+			Metas: ctl.loginMsg.Metas,
+			RunID: ctl.loginMsg.RunID,
+		},
+		NewProxy: *inMsg,
+	}
+	var remoteAddr string
+	retContent, err := ctl.pluginManager.NewProxy(content)
+	if err == nil {
+		inMsg = &retContent.NewProxy
+		remoteAddr, err = ctl.RegisterProxy(inMsg)
+	}
+
+	// register proxy in this control
+	resp := &msg.NewProxyResp{
+		ProxyName: inMsg.ProxyName,
+	}
+	if err != nil {
+		xl.Warnf("new proxy [%s] type [%s] error: %v", inMsg.ProxyName, inMsg.ProxyType, err)
+		resp.Error = util.GenerateResponseErrorString(fmt.Sprintf("new proxy [%s] error", inMsg.ProxyName),
+			err, lo.FromPtr(ctl.serverCfg.DetailedErrorsToClient))
+	} else {
+		resp.RemoteAddr = remoteAddr
+		xl.Infof("new proxy [%s] type [%s] success", inMsg.ProxyName, inMsg.ProxyType)
+		metrics.Server.NewProxy(inMsg.ProxyName, inMsg.ProxyType)
+	}
+	_ = ctl.msgDispatcher.Send(resp)
+}
+
+func (ctl *Control) handlePing(m msg.Message) {
+	xl := ctl.xl
+	inMsg := m.(*msg.Ping)
+
+	content := &plugin.PingContent{
+		User: plugin.UserInfo{
+			User:  ctl.loginMsg.User,
+			Metas: ctl.loginMsg.Metas,
+			RunID: ctl.loginMsg.RunID,
+		},
+		Ping: *inMsg,
+	}
+	retContent, err := ctl.pluginManager.Ping(content)
+	if err == nil {
+		inMsg = &retContent.Ping
+		err = ctl.authVerifier.VerifyPing(inMsg)
+	}
+	if err != nil {
+		xl.Warnf("received invalid ping: %v", err)
+		_ = ctl.msgDispatcher.Send(&msg.Pong{
+			Error: util.GenerateResponseErrorString("invalid ping", err, lo.FromPtr(ctl.serverCfg.DetailedErrorsToClient)),
+		})
 		return
 	}
-	ctl.allShutdown.WaitDone()
+	ctl.lastPing.Store(time.Now())
+	xl.Debugf("receive heartbeat")
+	_ = ctl.msgDispatcher.Send(&msg.Pong{})
 }
 
-func (ctl *Control) manager() {
+func (ctl *Control) handleNatHoleVisitor(m msg.Message) {
+	inMsg := m.(*msg.NatHoleVisitor)
+	ctl.rc.NatHoleController.HandleVisitor(inMsg, ctl.msgTransporter, ctl.loginMsg.User)
+}
+
+func (ctl *Control) handleNatHoleClient(m msg.Message) {
+	inMsg := m.(*msg.NatHoleClient)
+	ctl.rc.NatHoleController.HandleClient(inMsg, ctl.msgTransporter)
+}
+
+func (ctl *Control) handleNatHoleReport(m msg.Message) {
+	inMsg := m.(*msg.NatHoleReport)
+	ctl.rc.NatHoleController.HandleReport(inMsg)
+}
+
+func (ctl *Control) handleCloseProxy(m msg.Message) {
 	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Error("panic error: %v", err)
-			xl.Error(string(debug.Stack()))
-		}
-	}()
-
-	defer ctl.allShutdown.Start()
-	defer ctl.managerShutdown.Done()
-
-	var heartbeatCh <-chan time.Time
-	// Don't need application heartbeat here.
-	// yamux will do same thing.
-	if !ctl.serverCfg.TCPMux && ctl.serverCfg.HeartbeatTimeout > 0 {
-		heartbeat := time.NewTicker(time.Second)
-		defer heartbeat.Stop()
-		heartbeatCh = heartbeat.C
-	}
-
-	for {
-		select {
-		case <-heartbeatCh:
-			if time.Since(ctl.lastPing) > time.Duration(ctl.serverCfg.HeartbeatTimeout)*time.Second {
-				xl.Warn("heartbeat timeout")
-				return
-			}
-		case rawMsg, ok := <-ctl.readCh:
-			if !ok {
-				return
-			}
-
-			switch m := rawMsg.(type) {
-			case *msg.NewProxy:
-				content := &plugin.NewProxyContent{
-					User: plugin.UserInfo{
-						User:  ctl.loginMsg.User,
-						Metas: ctl.loginMsg.Metas,
-						RunID: ctl.loginMsg.RunID,
-					},
-					NewProxy: *m,
-				}
-				var remoteAddr string
-				retContent, err := ctl.pluginManager.NewProxy(content)
-				if err == nil {
-					m = &retContent.NewProxy
-					remoteAddr, err = ctl.RegisterProxy(m)
-				}
-
-				// register proxy in this control
-				resp := &msg.NewProxyResp{
-					ProxyName: m.ProxyName,
-				}
-				if err != nil {
-					xl.Warn("new proxy [%s] type [%s] error: %v", m.ProxyName, m.ProxyType, err)
-					resp.Error = util.GenerateResponseErrorString(fmt.Sprintf("new proxy [%s] error", m.ProxyName), err, ctl.serverCfg.DetailedErrorsToClient)
-				} else {
-					resp.RemoteAddr = remoteAddr
-					xl.Info("new proxy [%s] type [%s] success", m.ProxyName, m.ProxyType)
-					metrics.Server.NewProxy(m.ProxyName, m.ProxyType)
-				}
-				ctl.sendCh <- resp
-			case *msg.NatHoleVisitor:
-				go ctl.HandleNatHoleVisitor(m)
-			case *msg.NatHoleClient:
-				go ctl.HandleNatHoleClient(m)
-			case *msg.NatHoleReport:
-				go ctl.HandleNatHoleReport(m)
-			case *msg.CloseProxy:
-				_ = ctl.CloseProxy(m)
-				xl.Info("close proxy [%s] success", m.ProxyName)
-			case *msg.Ping:
-				content := &plugin.PingContent{
-					User: plugin.UserInfo{
-						User:  ctl.loginMsg.User,
-						Metas: ctl.loginMsg.Metas,
-						RunID: ctl.loginMsg.RunID,
-					},
-					Ping: *m,
-				}
-				retContent, err := ctl.pluginManager.Ping(content)
-				if err == nil {
-					m = &retContent.Ping
-					err = ctl.authVerifier.VerifyPing(m)
-				}
-				if err != nil {
-					xl.Warn("received invalid ping: %v", err)
-					ctl.sendCh <- &msg.Pong{
-						Error: util.GenerateResponseErrorString("invalid ping", err, ctl.serverCfg.DetailedErrorsToClient),
-					}
-					return
-				}
-				ctl.lastPing = time.Now()
-				ctl.sendCh <- &msg.Pong{}
-			}
-		}
-	}
-}
-
-func (ctl *Control) HandleNatHoleVisitor(m *msg.NatHoleVisitor) {
-	ctl.rc.NatHoleController.HandleVisitor(m, ctl.msgTransporter, ctl.loginMsg.User)
-}
-
-func (ctl *Control) HandleNatHoleClient(m *msg.NatHoleClient) {
-	ctl.rc.NatHoleController.HandleClient(m, ctl.msgTransporter)
-}
-
-func (ctl *Control) HandleNatHoleReport(m *msg.NatHoleReport) {
-	ctl.rc.NatHoleController.HandleReport(m)
+	inMsg := m.(*msg.CloseProxy)
+	_ = ctl.CloseProxy(inMsg)
+	xl.Infof("close proxy [%s] success", inMsg.ProxyName)
 }
 
 func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
-	var pxyConf config.ProxyConf
+	var pxyConf v1.ProxyConfigurer
 	// Load configures from NewProxy message and check.
-	pxyConf, err = config.NewProxyConfFromMsg(pxyMsg, ctl.serverCfg)
+	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.serverCfg)
 	if err != nil {
 		return
 	}
@@ -531,7 +444,15 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 
 	// NewProxy will return a interface Proxy.
 	// In fact it create different proxies by different proxy type, we just call run() here.
-	pxy, err := proxy.NewProxy(ctl.ctx, userInfo, ctl.rc, ctl.poolCount, ctl.GetWorkConn, pxyConf, ctl.serverCfg, ctl.loginMsg)
+	pxy, err := proxy.NewProxy(ctl.ctx, &proxy.Options{
+		UserInfo:           userInfo,
+		LoginMsg:           ctl.loginMsg,
+		PoolCount:          ctl.poolCount,
+		ResourceController: ctl.rc,
+		GetWorkConnFn:      ctl.GetWorkConn,
+		Configurer:         pxyConf,
+		ServerCfg:          ctl.serverCfg,
+	})
 	if err != nil {
 		return remoteAddr, err
 	}
@@ -598,7 +519,7 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConf().GetBaseConfig().ProxyType)
+	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
 
 	notifyContent := &plugin.CloseProxyContent{
 		User: plugin.UserInfo{
@@ -613,6 +534,5 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 	go func() {
 		_ = ctl.pluginManager.CloseProxy(notifyContent)
 	}()
-
 	return
 }

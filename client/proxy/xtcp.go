@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !frps
+
 package proxy
 
 import (
@@ -23,25 +25,25 @@ import (
 	fmux "github.com/libp2p/go-yamux"
 	"github.com/quic-go/quic-go"
 
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/nathole"
 	"github.com/fatedier/frp/pkg/transport"
-	utilnet "github.com/fatedier/frp/pkg/util/net"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
 func init() {
-	RegisterProxyFactory(reflect.TypeOf(&config.XTCPProxyConf{}), NewXTCPProxy)
+	RegisterProxyFactory(reflect.TypeOf(&v1.XTCPProxyConfig{}), NewXTCPProxy)
 }
 
 type XTCPProxy struct {
 	*BaseProxy
 
-	cfg *config.XTCPProxyConf
+	cfg *v1.XTCPProxyConfig
 }
 
-func NewXTCPProxy(baseProxy *BaseProxy, cfg config.ProxyConf) Proxy {
-	unwrapped, ok := cfg.(*config.XTCPProxyConf)
+func NewXTCPProxy(baseProxy *BaseProxy, cfg v1.ProxyConfigurer) Proxy {
+	unwrapped, ok := cfg.(*v1.XTCPProxyConfig)
 	if !ok {
 		return nil
 	}
@@ -57,17 +59,17 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 	var natHoleSidMsg msg.NatHoleSid
 	err := msg.ReadMsgInto(conn, &natHoleSidMsg)
 	if err != nil {
-		xl.Error("xtcp read from workConn error: %v", err)
+		xl.Errorf("xtcp read from workConn error: %v", err)
 		return
 	}
 
-	xl.Trace("nathole prepare start")
+	xl.Tracef("nathole prepare start")
 	prepareResult, err := nathole.Prepare([]string{pxy.clientCfg.NatHoleSTUNServer})
 	if err != nil {
-		xl.Warn("nathole prepare error: %v", err)
+		xl.Warnf("nathole prepare error: %v", err)
 		return
 	}
-	xl.Info("nathole prepare success, nat type: %s, behavior: %s, addresses: %v, assistedAddresses: %v",
+	xl.Infof("nathole prepare success, nat type: %s, behavior: %s, addresses: %v, assistedAddresses: %v",
 		prepareResult.NatType, prepareResult.Behavior, prepareResult.Addrs, prepareResult.AssistedAddrs)
 	defer prepareResult.ListenConn.Close()
 
@@ -75,28 +77,28 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 	transactionID := nathole.NewTransactionID()
 	natHoleClientMsg := &msg.NatHoleClient{
 		TransactionID: transactionID,
-		ProxyName:     pxy.cfg.ProxyName,
+		ProxyName:     pxy.cfg.Name,
 		Sid:           natHoleSidMsg.Sid,
 		MappedAddrs:   prepareResult.Addrs,
 		AssistedAddrs: prepareResult.AssistedAddrs,
 	}
 
-	xl.Trace("nathole exchange info start")
+	xl.Tracef("nathole exchange info start")
 	natHoleRespMsg, err := nathole.ExchangeInfo(pxy.ctx, pxy.msgTransporter, transactionID, natHoleClientMsg, 5*time.Second)
 	if err != nil {
-		xl.Warn("nathole exchange info error: %v", err)
+		xl.Warnf("nathole exchange info error: %v", err)
 		return
 	}
 
-	xl.Info("get natHoleRespMsg, sid [%s], protocol [%s], candidate address %v, assisted address %v, detectBehavior: %+v",
+	xl.Infof("get natHoleRespMsg, sid [%s], protocol [%s], candidate address %v, assisted address %v, detectBehavior: %+v",
 		natHoleRespMsg.Sid, natHoleRespMsg.Protocol, natHoleRespMsg.CandidateAddrs,
 		natHoleRespMsg.AssistedAddrs, natHoleRespMsg.DetectBehavior)
 
 	listenConn := prepareResult.ListenConn
-	newListenConn, raddr, err := nathole.MakeHole(pxy.ctx, listenConn, natHoleRespMsg, []byte(pxy.cfg.Sk))
+	newListenConn, raddr, err := nathole.MakeHole(pxy.ctx, listenConn, natHoleRespMsg, []byte(pxy.cfg.Secretkey))
 	if err != nil {
 		listenConn.Close()
-		xl.Warn("make hole error: %v", err)
+		xl.Warnf("make hole error: %v", err)
 		_ = pxy.msgTransporter.Send(&msg.NatHoleReport{
 			Sid:     natHoleRespMsg.Sid,
 			Success: false,
@@ -104,7 +106,7 @@ func (pxy *XTCPProxy) InWorkConn(conn net.Conn, startWorkConnMsg *msg.StartWorkC
 		return
 	}
 	listenConn = newListenConn
-	xl.Info("establishing nat hole connection successful, sid [%s], remoteAddr [%s]", natHoleRespMsg.Sid, raddr)
+	xl.Infof("establishing nat hole connection successful, sid [%s], remoteAddr [%s]", natHoleRespMsg.Sid, raddr)
 
 	_ = pxy.msgTransporter.Send(&msg.NatHoleReport{
 		Sid:     natHoleRespMsg.Sid,
@@ -126,14 +128,14 @@ func (pxy *XTCPProxy) listenByKCP(listenConn *net.UDPConn, raddr *net.UDPAddr, s
 	laddr, _ := net.ResolveUDPAddr("udp", listenConn.LocalAddr().String())
 	lConn, err := net.DialUDP("udp", laddr, raddr)
 	if err != nil {
-		xl.Warn("dial udp error: %v", err)
+		xl.Warnf("dial udp error: %v", err)
 		return
 	}
 	defer lConn.Close()
 
-	remote, err := utilnet.NewKCPConnFromUDP(lConn, true, raddr.String())
+	remote, err := netpkg.NewKCPConnFromUDP(lConn, true, raddr.String())
 	if err != nil {
-		xl.Warn("create kcp connection from udp connection error: %v", err)
+		xl.Warnf("create kcp connection from udp connection error: %v", err)
 		return
 	}
 
@@ -143,7 +145,7 @@ func (pxy *XTCPProxy) listenByKCP(listenConn *net.UDPConn, raddr *net.UDPAddr, s
 	fmuxCfg.LogOutput = io.Discard
 	session, err := fmux.Server(remote, fmuxCfg)
 	if err != nil {
-		xl.Error("create mux session error: %v", err)
+		xl.Errorf("create mux session error: %v", err)
 		return
 	}
 	defer session.Close()
@@ -151,10 +153,10 @@ func (pxy *XTCPProxy) listenByKCP(listenConn *net.UDPConn, raddr *net.UDPAddr, s
 	for {
 		muxConn, err := session.Accept()
 		if err != nil {
-			xl.Error("accept connection error: %v", err)
+			xl.Errorf("accept connection error: %v", err)
 			return
 		}
-		go pxy.HandleTCPWorkConnection(muxConn, startWorkConnMsg, []byte(pxy.cfg.Sk))
+		go pxy.HandleTCPWorkConnection(muxConn, startWorkConnMsg, []byte(pxy.cfg.Secretkey))
 	}
 }
 
@@ -164,34 +166,34 @@ func (pxy *XTCPProxy) listenByQUIC(listenConn *net.UDPConn, _ *net.UDPAddr, star
 
 	tlsConfig, err := transport.NewServerTLSConfig("", "", "")
 	if err != nil {
-		xl.Warn("create tls config error: %v", err)
+		xl.Warnf("create tls config error: %v", err)
 		return
 	}
 	tlsConfig.NextProtos = []string{"frp"}
 	quicListener, err := quic.Listen(listenConn, tlsConfig,
 		&quic.Config{
-			MaxIdleTimeout:     time.Duration(pxy.clientCfg.QUICMaxIdleTimeout) * time.Second,
-			MaxIncomingStreams: int64(pxy.clientCfg.QUICMaxIncomingStreams),
-			KeepAlivePeriod:    time.Duration(pxy.clientCfg.QUICKeepalivePeriod) * time.Second,
+			MaxIdleTimeout:     time.Duration(pxy.clientCfg.Transport.QUIC.MaxIdleTimeout) * time.Second,
+			MaxIncomingStreams: int64(pxy.clientCfg.Transport.QUIC.MaxIncomingStreams),
+			KeepAlivePeriod:    time.Duration(pxy.clientCfg.Transport.QUIC.KeepalivePeriod) * time.Second,
 		},
 	)
 	if err != nil {
-		xl.Warn("dial quic error: %v", err)
+		xl.Warnf("dial quic error: %v", err)
 		return
 	}
 	// only accept one connection from raddr
 	c, err := quicListener.Accept(pxy.ctx)
 	if err != nil {
-		xl.Error("quic accept connection error: %v", err)
+		xl.Errorf("quic accept connection error: %v", err)
 		return
 	}
 	for {
 		stream, err := c.AcceptStream(pxy.ctx)
 		if err != nil {
-			xl.Debug("quic accept stream error: %v", err)
+			xl.Debugf("quic accept stream error: %v", err)
 			_ = c.CloseWithError(0, "")
 			return
 		}
-		go pxy.HandleTCPWorkConnection(utilnet.QuicStreamToNetConn(stream, c), startWorkConnMsg, []byte(pxy.cfg.Sk))
+		go pxy.HandleTCPWorkConnection(netpkg.QuicStreamToNetConn(stream, c), startWorkConnMsg, []byte(pxy.cfg.Secretkey))
 	}
 }

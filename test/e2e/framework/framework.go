@@ -29,8 +29,8 @@ type Framework struct {
 	// ports used in this framework indexed by port name.
 	usedPorts map[string]int
 
-	// record ports alloced by this framework and release them after each test
-	allocedPorts []int
+	// record ports allocated by this framework and release them after each test
+	allocatedPorts []int
 
 	// portAllocator to alloc port for this test case.
 	portAllocator *port.Allocator
@@ -67,7 +67,7 @@ func NewDefaultFramework() *Framework {
 		TotalParallelNode: suiteConfig.ParallelTotal,
 		CurrentNodeIndex:  suiteConfig.ParallelProcess,
 		FromPortIndex:     10000,
-		ToPortIndex:       60000,
+		ToPortIndex:       30000,
 	}
 	return NewFramework(options)
 }
@@ -153,11 +153,11 @@ func (f *Framework) AfterEach() {
 	}
 	f.usedPorts = make(map[string]int)
 
-	// release alloced ports
-	for _, port := range f.allocedPorts {
+	// release allocated ports
+	for _, port := range f.allocatedPorts {
 		f.portAllocator.Release(port)
 	}
-	f.allocedPorts = make([]int, 0)
+	f.allocatedPorts = make([]int, 0)
 
 	// clear os envs
 	f.osEnvs = make([]string, 0)
@@ -217,7 +217,7 @@ func (f *Framework) RenderTemplates(templates []string) (outs []string, ports ma
 	}
 
 	for _, t := range templates {
-		tmpl, err := template.New("").Parse(t)
+		tmpl, err := template.New("frp-e2e").Parse(t)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -237,7 +237,7 @@ func (f *Framework) PortByName(name string) int {
 func (f *Framework) AllocPort() int {
 	port := f.portAllocator.Get()
 	ExpectTrue(port > 0, "alloc port failed")
-	f.allocedPorts = append(f.allocedPorts, port)
+	f.allocatedPorts = append(f.allocatedPorts, port)
 	return port
 }
 
@@ -260,7 +260,7 @@ func (f *Framework) SetEnvs(envs []string) {
 
 func (f *Framework) WriteTempFile(name string, content string) string {
 	filePath := filepath.Join(f.TempDirectory, name)
-	err := os.WriteFile(filePath, []byte(content), 0o766)
+	err := os.WriteFile(filePath, []byte(content), 0o600)
 	ExpectNoError(err)
 	return filePath
 }
